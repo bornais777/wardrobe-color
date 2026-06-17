@@ -639,6 +639,11 @@ ${imageBase64 ? `图中是参考衣物，请识别其款式版型（如：宽松
       imageMime,
     })).trim();
     console.log("[buildPromptViaAI] AI返回:", rawAiTags.slice(0,200));
+    // 进度里显示AI返回的前80字，方便调试
+    if (typeof setGenProgress === "function") {
+      setGenProgress(rawAiTags ? `AI已生成: ${rawAiTags.slice(0,60)}…` : "⚠️ AI返回为空，使用fallback");
+      await new Promise(r=>setTimeout(r,1500)); // 显示1.5秒
+    }
     const aiTags = rawAiTags || "1girl, full body, standing, white background, fashion photography, real clothing, everyday wear";
 
     // 画师串放最后，AI生成的tag已经包含构图词
