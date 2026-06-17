@@ -15,6 +15,82 @@ const T = {
 };
 
 // ═══════════════════════════════════════════════════════
+// 统一 LLM 调用（支持 Anthropic 原生 + OpenAI 兼容接口）
+// ═══════════════════════════════════════════════════════
+async function callLLM({ settings, system, userContent, maxTokens = 1000 }) {
+  const mode = settings.llmMode || "anthropic"; // "anthropic" | "openai"
+  const model = settings.llmModel || "claude-sonnet-4-6";
+
+  if (mode === "openai") {
+    // OpenAI 兼容格式（适用于第三方中转、本地模型等）
+    const baseUrl = (settings.llmBaseUrl || "https://api.openai.com").replace(/\/$/, "");
+    const apiKey = settings.llmApiKey || "";
+    const msgs = [];
+    if (system) msgs.push({ role: "system", content: system });
+    msgs.push({ role: "user", content: userContent });
+    const resp = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({ model, max_tokens: maxTokens, messages: msgs }),
+    });
+    const data = await resp.json();
+    return data.choices?.[0]?.message?.content || "";
+  } else {
+    // Anthropic 原生格式
+    const resp = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model, max_tokens: maxTokens,
+        ...(system ? { system } : {}),
+        messages: [{ role: "user", content: userContent }],
+      }),
+    });
+    const data = await resp.json();
+    return data.content?.[0]?.text || "";
+  }
+}
+
+// 多轮对话版（对话弹窗用，需要传完整历史）
+async function callLLMChat({ settings, system, messages, maxTokens = 1000 }) {
+  const mode = settings.llmMode || "anthropic";
+  const model = settings.llmModel || "claude-sonnet-4-6";
+
+  if (mode === "openai") {
+    const baseUrl = (settings.llmBaseUrl || "https://api.openai.com").replace(/\/$/, "");
+    const apiKey = settings.llmApiKey || "";
+    const msgs = [];
+    if (system) msgs.push({ role: "system", content: system });
+    msgs.push(...messages);
+    const resp = await fetch(`${baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({ model, max_tokens: maxTokens, messages: msgs }),
+    });
+    const data = await resp.json();
+    return data.choices?.[0]?.message?.content || "";
+  } else {
+    const resp = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model, max_tokens: maxTokens,
+        ...(system ? { system } : {}),
+        messages,
+      }),
+    });
+    const data = await resp.json();
+    return data.content?.[0]?.text || "";
+  }
+}
+
+// ═══════════════════════════════════════════════════════
 // 色彩工具
 // ═══════════════════════════════════════════════════════
 function toHex(h, s, l) {
@@ -268,13 +344,13 @@ function ChatModal({ imageItem, onClose, settings, onUpdateMemory }) {
       const sys = settings.charCard
         ? `你是穿搭顾问角色。设定：${settings.charCard}\n偏好记忆：${settings.memory||"无"}\n针对当前AI生成的穿搭方案给出具体建议，不要泛泛而谈。`
         : `你是有审美品位的穿搭顾问。偏好记忆：${settings.memory||"无"}\n给出具体、有观点的建议。`;
-      const resp = await fetch("https://api.anthropic.com/v1/messages", {
-        method:"POST", headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({ model:"claude-sonnet-4-6", max_tokens:1000, system:sys,
-          messages:next.map(m=>({role:m.role,content:m.content})) }),
+      const reply = await callLLMChat({
+        settings,
+        system: sys,
+        messages: next.map(m=>({role:m.role,content:m.content})),
+        maxTokens: 1000,
       });
-      const data = await resp.json();
-      setMsgs(p=>[...p,{role:"assistant",content:data.content?.[0]?.text||"（无回复）"}]);
+      setMsgs(p=>[...p,{role:"assistant",content:reply||"（无回复）"}]);
     } catch { setMsgs(p=>[...p,{role:"assistant",content:"连接失败，请检查API配置。"}]); }
     setLoading(false);
   };
@@ -284,22 +360,15 @@ function ChatModal({ imageItem, onClose, settings, onUpdateMemory }) {
     setLoading(true);
     try {
       const convText = msgs.map(m=>`${m.role==="user"?"用户":"助手"}：${m.content}`).join("\n");
-      const resp = await fetch("https://api.anthropic.com/v1/messages", {
-        method:"POST", headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({ model:"claude-sonnet-4-6", max_tokens:300,
-          system:`从对话中提取用户的穿搭偏好信息。
-规则：
-- 只提取明确表达的偏好，不要推断
-- 格式：每条一行，以「喜欢」「不喜欢」「倾向」「避免」开头
-- 最多8条，每条15字以内
-- 只输出偏好列表，不要其他内容`,
-          messages:[{role:"user",content:`对话记录：
+      const newPrefs = (await callLLM({
+        settings,
+        system: `从对话中提取用户的穿搭偏好信息。规则：只提取明确表达的偏好，不要推断。格式：每条一行，以「喜欢」「不喜欢」「倾向」「避免」开头。最多8条，每条15字以内。只输出偏好列表，不要其他内容。`,
+        userContent: `对话记录：
 ${convText}
 
-提取穿搭偏好：`}] }),
-      });
-      const data = await resp.json();
-      const newPrefs = data.content?.[0]?.text?.trim() || "";
+提取穿搭偏好：`,
+        maxTokens: 300,
+      })).trim() || "";
       if (newPrefs && onUpdateMemory) {
         const existing = settings.memory ? settings.memory.trim() : "";
         const merged = existing ? existing + "\n" + newPrefs : newPrefs;
@@ -464,13 +533,12 @@ function GeneratePage({ settings, onSaveToWardrobe, onUpdateMemory,
 - 加入穿搭风格tag：如 casual, streetwear, minimalist, layering等
 - 20-35个tag，不要重复`;
 
-    const resp = await fetch("https://api.anthropic.com/v1/messages", {
-      method:"POST", headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({ model:"claude-sonnet-4-6", max_tokens:500, system:sys,
-        messages:[{ role:"user", content:`配色方案：${scheme.name}\n色彩描述：${colorDesc}\n用户审美偏好：${settings.aestheticDesc||""}` }] }),
-    });
-    const data = await resp.json();
-    const aiTags = data.content?.[0]?.text?.trim() || "1girl, full body, fashion, white background";
+    const aiTags = (await callLLM({
+      settings,
+      system: sys,
+      userContent: `配色方案：${scheme.name}\n色彩描述：${colorDesc}\n用户审美偏好：${settings.aestheticDesc||""}`,
+      maxTokens: 500,
+    })).trim() || "1girl, full body, fashion, white background";
     // 组合：前置画师串 + AI生成 + 后置
     const finalTag = [artistTags, aiTags].filter(Boolean).join(", ");
     return { tag: finalTag, negative: negTags };
@@ -1193,7 +1261,32 @@ function SettingsPage({ settings, setSettings }) {
       </Section>
 
       <Section title="文字 AI">
-        <Field label="模型" fkey="textModel" placeholder="claude-sonnet-4-6"/>
+        {/* 接口模式切换 */}
+        <div style={{ marginBottom:"14px" }}>
+          <p style={{ fontSize:"10px",color:T.textMuted,margin:"0 0 6px",letterSpacing:"0.05em" }}>接口类型</p>
+          <div style={{ display:"flex",gap:"6px" }}>
+            {[{val:"anthropic",label:"Anthropic 原生"},{val:"openai",label:"OpenAI 兼容（第三方）"}].map(opt=>(
+              <button key={opt.val} onClick={()=>setForm(p=>({...p,llmMode:opt.val}))}
+                style={{ flex:1,padding:"8px",borderRadius:T.radiusSm,border:"none",
+                  fontSize:"11px",cursor:"pointer",
+                  backgroundColor:form.llmMode===opt.val||(!form.llmMode&&opt.val==="anthropic")?T.accent:T.accentSoft,
+                  color:form.llmMode===opt.val||(!form.llmMode&&opt.val==="anthropic")?"#fff":T.textSub }}>
+                {opt.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* OpenAI兼容模式额外字段 */}
+        {(form.llmMode==="openai") && (
+          <>
+            <Field label="Base URL" fkey="llmBaseUrl" placeholder="https://api.openai.com 或第三方地址"/>
+            <Field label="API Key" fkey="llmApiKey" placeholder="sk-xxxxxxx 或第三方key" type="password"/>
+          </>
+        )}
+
+        <Field label="模型名" fkey="llmModel"
+          placeholder={form.llmMode==="openai"?"gpt-4o / deepseek-chat / …":"claude-sonnet-4-6"}/>
         <Field label="审美偏好描述（辅助prompt生成）" fkey="aestheticDesc"
           placeholder="如：日系街拍、宽松廓形、低饱和莫兰迪色系…" multiline/>
       </Section>
@@ -1224,8 +1317,8 @@ export default function App() {
     naiToken:"", naiModel:"nai-diffusion-4-5-full", naiSize:"竖图",
     negative:"lowres, worst quality, bad anatomy, text, watermark, signature",
     artistPresets:[], activePreset:null,
-    textModel:"claude-sonnet-4-6", aestheticDesc:"",
-    charCard:"", memory:"",
+    llmMode:"anthropic", llmBaseUrl:"", llmApiKey:"", llmModel:"claude-sonnet-4-6",
+    aestheticDesc:"", charCard:"", memory:"",
   });
 
   // ── 搭配页state提升，tab切换不丢失 ──
