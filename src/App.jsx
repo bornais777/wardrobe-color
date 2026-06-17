@@ -295,6 +295,7 @@ function schemeToStructuredText(scheme, skinTone) {
     return `  - ${c.label}（${role}）: ${c.hex}, ${lightName(hsl.l)} ${satName(hsl.s)} ${hueName(hsl.h)}${isRef?" [参考色，可购入方向]":""}`;
   };
 
+  if (!skinTone) skinTone = { hex:"#F0E0C8", label:"自然白", isWarm:false };
   const schemeStyle = {
     A: "无彩色系，强调廓形与质感，任何肤色友好",
     B: "临近色调和，主色+低饱临近+高饱小点缀，层次丰富",
@@ -568,7 +569,8 @@ function GeneratePage({ settings, onSaveToWardrobe, onUpdateMemory, chatMessages
     const negTags = settings.negative || "";
 
     // 结构化色块文本
-    const colorStructure = schemeToStructuredText(scheme, selectedSkin);
+    const skinRef = selectedSkin || { hex:"#F0E0C8", label:"自然白", isWarm:false };
+    const colorStructure = schemeToStructuredText(scheme, skinRef);
 
     // 读图：把上传的衣服图转base64
     let imageBase64 = null;
@@ -737,7 +739,10 @@ ${imageBase64 ? "请先观察图中衣物的款式和风格，再结合以上配
       setStep("result");
 
     } catch (err) {
-      setGenProgress(`生成失败：${err.message}`);
+      console.error("生成失败:", err);
+      setGenProgress(`生成失败：${err.message || String(err)}`);
+      setGenerating(false);
+      return;
     }
     setGenerating(false);
   };
