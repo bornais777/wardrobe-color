@@ -618,18 +618,19 @@ ${imageBase64 ? `图中是参考衣物，请识别其款式版型（如：宽松
 
 按照色块分配规则，输出NAI tag串：`;
 
-    const aiTags = (await callLLM({
+    const rawAiTags = (await callLLM({
       settings,
       system: sys,
       userContent: userMsg,
       maxTokens: 600,
       imageBase64,
       imageMime,
-    })).trim() || "1girl, full body, fashion photography, white background, everyday wear";
+    })).trim();
+    console.log("[buildPromptViaAI] AI返回:", rawAiTags.slice(0,200));
+    const aiTags = rawAiTags || "1girl, full body, standing, white background, fashion photography, real clothing, everyday wear";
 
-    // 构图关键tag放最前面保证权重，画师串放后面
-    const coreLayout = "full body, standing, white background, fashion photography";
-    const finalTag = [coreLayout, aiTags, artistTags].filter(Boolean).join(", ");
+    // 画师串放最后，AI生成的tag已经包含构图词
+    const finalTag = [aiTags, artistTags].filter(Boolean).join(", ");
     return { tag: finalTag, negative: negTags };
   };
 
@@ -981,8 +982,19 @@ ${imageBase64 ? `图中是参考衣物，请识别其款式版型（如：宽松
           <div style={{ marginBottom:"18px" }} ref={resultRef}>
             <SectionLabel>04 · 生成结果</SectionLabel>
             <div style={{ borderRadius:T.radius,overflow:"hidden",border:`1px solid ${T.border}`,
-              boxShadow:T.shadowMd,marginBottom:"10px" }}>
+              boxShadow:T.shadowMd,marginBottom:"10px",position:"relative",cursor:"context-menu" }}
+              onContextMenu={e=>{e.preventDefault();setShowPromptEdit(v=>!v);setEditingPrompt(resultImg.prompt||"");}}
+              onTouchStart={e=>{
+                const t=setTimeout(()=>{setShowPromptEdit(v=>!v);setEditingPrompt(resultImg.prompt||"");},600);
+                e.currentTarget._lpt=t;
+              }}
+              onTouchEnd={e=>{clearTimeout(e.currentTarget._lpt);}}
+              onTouchMove={e=>{clearTimeout(e.currentTarget._lpt);}}>
               <img src={resultImg.dataUrl} alt="生成图" style={{ width:"100%",display:"block" }}/>
+              <div style={{ position:"absolute",bottom:"8px",right:"8px",
+                backgroundColor:"rgba(0,0,0,0.45)",borderRadius:"6px",
+                padding:"3px 7px",fontSize:"9px",color:"rgba(255,255,255,0.7)",
+                pointerEvents:"none" }}>右键/长按编辑Prompt</div>
             </div>
             {/* prompt查看/编辑 */}
             {showPromptEdit ? (
