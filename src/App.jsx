@@ -22,19 +22,23 @@ async function callLLM({ settings, system, userContent, maxTokens = 1000, imageB
   const model = settings.llmModel || "claude-sonnet-4-6";
 
   if (mode === "openai") {
-    // OpenAI 兼容格式（Gemini Flash等均支持vision）
+    // OpenAI 兼容格式（Gemini Flash等）
+    // Gemini兼容接口system role支持不稳定，把system内容合并进user消息更可靠
     const baseUrl = (settings.llmBaseUrl || "https://api.openai.com").replace(/\/$/, "");
     const apiKey = settings.llmApiKey || "";
     const msgs = [];
-    if (system) msgs.push({ role: "system", content: system });
-    // 有图片时构建多模态content
+    // system内容合并到第一条user消息前
+    const fullUserContent = system ? `${system}
+
+---
+${userContent}` : userContent;
     if (imageBase64) {
       msgs.push({ role: "user", content: [
         { type: "image_url", image_url: { url: `data:${imageMime};base64,${imageBase64}` } },
-        { type: "text", text: userContent },
+        { type: "text", text: fullUserContent },
       ]});
     } else {
-      msgs.push({ role: "user", content: userContent });
+      msgs.push({ role: "user", content: fullUserContent });
     }
     const resp = await fetch(`${baseUrl}/v1/chat/completions`, {
       method: "POST",
@@ -42,6 +46,7 @@ async function callLLM({ settings, system, userContent, maxTokens = 1000, imageB
       body: JSON.stringify({ model, max_tokens: maxTokens, messages: msgs }),
     });
     const data = await resp.json();
+    console.log("[callLLM OpenAI] status:", resp.status, "choices:", data.choices?.length, "error:", data.error);
     return data.choices?.[0]?.message?.content || "";
   } else {
     // Anthropic 原生格式（支持vision）
@@ -73,9 +78,16 @@ async function callLLMChat({ settings, system, messages, maxTokens = 1000 }) {
   if (mode === "openai") {
     const baseUrl = (settings.llmBaseUrl || "https://api.openai.com").replace(/\/$/, "");
     const apiKey = settings.llmApiKey || "";
-    const msgs = [];
-    if (system) msgs.push({ role: "system", content: system });
-    msgs.push(...messages);
+    const msgs = [...messages];
+    // system合并进第一条user消息
+    if (system && msgs.length > 0 && msgs[0].role === "user") {
+      msgs[0] = { ...msgs[0], content: `${system}
+
+---
+${msgs[0].content}` };
+    } else if (system) {
+      msgs.unshift({ role: "system", content: system });
+    }
     const resp = await fetch(`${baseUrl}/v1/chat/completions`, {
       method: "POST",
       headers: {
