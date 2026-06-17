@@ -589,28 +589,30 @@ function GeneratePage({ settings, onSaveToWardrobe, onUpdateMemory, chatMessages
     }
 
     const sys = `你是精通色彩搭配的穿搭造型师，同时熟悉NovelAI的tag语法。
-你的任务：根据用户上传的衣物图片和配色方案，设计一套完整的日常穿搭，转成NAI tag串。
+任务：根据配色方案和参考衣物，设计一套完整日常穿搭，输出NAI tag串。
 
-思考框架（内部思考，不输出）：
-1. 图中衣物是什么款式、版型、风格定位？（如：宽松oversize卫衣、修身西装外套…）
-2. 这件衣物适合搭配什么下装/外层？什么廓形最平衡？
-3. 按色块分配：主色→最大面积单品颜色，次要色→搭配单品颜色，点缀色→配件/腰带/细节
-4. 整体风格是否日常可穿？避免奇幻礼服等脱离现实的方向
+【强制要求——必须全部满足】
+1. 构图：full body standing, white background——人物必须从头到脚完整出现
+2. 每个色块必须对应具体单品：
+   - 主色（最大面积）→ 上衣或外套的颜色，写成"[颜色] [具体单品]"，如"rose pink zip-up hoodie"
+   - 次要色（中等面积）→ 下装的颜色，写成"[颜色] [具体下装]"，如"sage green wide-leg pants"
+   - 点缀色① → 配件或细节，如"gray canvas sneakers"
+   - 点缀色② → 小配件，如"orange bucket hat"或腰带/包/耳饰
+3. 下装必须出现：pants / skirt / shorts / trousers 中的一个，且带颜色前缀
+4. 风格：real clothing, everyday wear, street fashion——禁止奇幻、礼服、古风
 
-输出规则：
-- 只输出英文tag串，逗号分隔，不要任何解释或序号
-- 必须包含：1girl, full body, white background, fashion photography, real clothing, everyday wear
-- 必须体现色块分配（如 white shirt, blue wide-leg pants, orange accessories）
-- 廓形tag（如 oversized, fitted, layered, high-waisted）
-- 服装材质/细节tag（如 cotton, linen, denim, silk, knit）
-- 25-40个tag，不重复`;
+输出格式：只输出英文tag串，逗号分隔，不加解释。
+必含tag：full body, standing, white background, fashion photography, real clothing, everyday wear
+总计25-40个tag。`;
 
     const userMsg = `${colorStructure}
 
 用户审美偏好：${settings.aestheticDesc||"无特别偏好"}
 
-${imageBase64 ? "请先观察图中衣物的款式和风格，再结合以上配色方案设计完整搭配。" : "（未上传衣物图，请根据配色方案自行设计穿搭）"}
-请输出NAI tag串：`;
+${imageBase64 ? `图中是参考衣物，请识别其款式版型（如：宽松卫衣/修身外套/针织衫…），
+将其作为主色对应的上衣单品，再根据配色方案补全下装和配件。` : "（未上传衣物图，请根据配色方案自行设计完整穿搭）"}
+
+按照色块分配规则，输出NAI tag串：`;
 
     const aiTags = (await callLLM({
       settings,
@@ -621,7 +623,9 @@ ${imageBase64 ? "请先观察图中衣物的款式和风格，再结合以上配
       imageMime,
     })).trim() || "1girl, full body, fashion photography, white background, everyday wear";
 
-    const finalTag = [artistTags, aiTags].filter(Boolean).join(", ");
+    // 构图关键tag放最前面保证权重，画师串放后面
+    const coreLayout = "full body, standing, white background, fashion photography";
+    const finalTag = [coreLayout, aiTags, artistTags].filter(Boolean).join(", ");
     return { tag: finalTag, negative: negTags };
   };
 
