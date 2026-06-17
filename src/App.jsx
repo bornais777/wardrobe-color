@@ -603,38 +603,54 @@ function GeneratePage({ settings, onSaveToWardrobe, onUpdateMemory, onAddMateria
       } catch { imageBase64 = null; }
     }
 
-    const sys = `You are a fashion stylist who generates NovelAI image prompts.
-Output ONLY a comma-separated English tag string. No explanations, no numbering, no markdown.
+    // 把色块直接转成颜色描述词，硬编码保证一定出现
+    const hslToColorName = (h, s, l) => {
+      if (s < 12) return l > 70 ? "light gray" : l > 40 ? "gray" : "dark gray";
+      if (l > 85) return "off-white"; if (l < 20) return "near-black";
+      const names = [[15,"red"],[40,"orange"],[65,"yellow"],[80,"yellow-green"],
+        [150,"green"],[175,"teal"],[200,"sky blue"],[240,"blue"],[270,"purple"],
+        [300,"violet"],[330,"pink"],[360,"red"]];
+      const hue = names.find(([deg]) => h <= deg)?.[1] || "neutral";
+      const lt = l > 70 ? "light " : l < 35 ? "dark " : "";
+      const sat = s < 30 ? "muted " : s > 70 ? "vivid " : "";
+      return `${lt}${sat}${hue}`.trim();
+    };
+    const hexToHSL2 = (hex) => {
+      let r=parseInt(hex.slice(1,3),16)/255, g=parseInt(hex.slice(3,5),16)/255, b=parseInt(hex.slice(5,7),16)/255;
+      const max=Math.max(r,g,b), min=Math.min(r,g,b), l=(max+min)/2;
+      if(max===min) return {h:0,s:0,l:Math.round(l*100)};
+      const d=max-min, s=l>0.5?d/(2-max-min):d/(max+min);
+      let h=0;
+      if(max===r) h=((g-b)/d+(g<b?6:0))/6;
+      else if(max===g) h=((b-r)/d+2)/6;
+      else h=((r-g)/d+4)/6;
+      return {h:Math.round(h*360),s:Math.round(s*100),l:Math.round(l*100)};
+    };
+    // 从色块提取颜色描述
+    const nonSkinColors = selectedScheme.colors.filter(c=>c.size!=="lg"&&!c.isRef);
+    const mainC = nonSkinColors.find(c=>c.label.includes("主")||c.size==="md");
+    const secondC = nonSkinColors.filter(c=>c.size==="md"&&c!==mainC)[0];
+    const accentCs = nonSkinColors.filter(c=>c.size==="sm");
+    const toName = (hex) => { const {h,s,l}=hexToHSL2(hex); return hslToColorName(h,s,l); };
+    // 硬编码的颜色单品tag
+    const mainTag = mainC ? `${toName(mainC.hex)} top` : "";
+    const bottomTag = secondC ? `${toName(secondC.hex)} pants` : accentCs[0] ? `${toName(accentCs[0].hex)} pants` : "";
+    const acc1Tag = accentCs[0] ? `${toName(accentCs[0].hex)} sneakers` : "";
+    const acc2Tag = accentCs[1] ? `${toName(accentCs[1].hex)} bag` : "";
+    const mandatoryColorTags = [mainTag, bottomTag, acc1Tag, acc2Tag].filter(Boolean).join(", ");
 
-RULES:
-- Must include: full body, standing, white background, fashion photography, real clothing, everyday wear, street fashion
-- Map each color to a specific clothing item using "[color adjective] [garment]" format
-- Main color (largest area) → top garment (e.g. "caramel brown oversized hoodie")
-- Secondary color → bottom garment (e.g. "sage green wide-leg pants") — REQUIRED
-- Accent color 1 → shoes or bag (e.g. "yellow sneakers")
-- Accent color 2 → small accessory (e.g. "teal earrings")
-- Include silhouette tags: oversized / fitted / layered / high-waisted
-- Include material tags: cotton / denim / knit / linen
-- NO fantasy, NO gown, NO ancient style, NO formal wear
-- Total: 25-40 tags`;
+    const sys = `You are a NovelAI fashion prompt writer.
+I will give you mandatory color+garment tags. Your job is to EXPAND them into a full outfit description.
+Add: specific garment style (hoodie/coat/skirt/jeans etc), silhouette (oversized/fitted/high-waisted), material (cotton/denim/knit), styling details, and required base tags.
+Do NOT change the colors. Output ONLY a comma-separated English tag string, 25-40 tags total.
+Required base tags to include: 1girl, full body, standing, white background, fashion photography, real clothing, everyday wear, street fashion
+NO fantasy, NO gown, NO ancient costume.`;
 
-    const colorLines = selectedScheme.colors.map(c => {
-      const role = c.size==="lg" ? "skin tone (reference only)" :
-                   c.label.includes("主") ? "MAIN COLOR - largest garment" :
-                   c.size==="md" ? "secondary color - medium area" : "accent color - small detail";
-      return `  ${role}: ${c.hex} (${c.label})${c.isRef?" [reference direction]":""}`;
-    }).join("\n");
-    const schemeStyleEn = {A:"monochrome black/white/gray",B:"analogous with small accent",
-      C:"muted split-complementary",D:"near-complementary soft",E:"high-saturation bold"};
     const mainHex = selectedColor?.hex || "";
-    const userMsg = `COLOR SCHEME: ${selectedScheme?.name||""} — ${schemeStyleEn[selectedScheme?.id]||""}
-COLOR ASSIGNMENTS:
-${colorLines}
-User preference: ${settings.aestheticDesc||"none"}
-${imageBase64
-  ? "The image shows the reference garment. Identify its silhouette, use it as the main color top, add matching bottom and accessories."
-  : `No image. STRICTLY use color assignments. Main color ${mainHex} MUST appear on the largest garment. Do NOT substitute.`}
-Output the NAI tag string now:`;
+    const userMsg = `Mandatory outfit tags (DO NOT change these colors): ${mandatoryColorTags}
+${imageBase64 ? "Reference image shows the main garment style — keep the silhouette, expand the outfit." : ""}
+User style preference: ${settings.aestheticDesc||"casual everyday"}
+Expand into a full 25-40 tag NAI prompt string:`;
 
     const rawAiTags = (await callLLM({
       settings,
