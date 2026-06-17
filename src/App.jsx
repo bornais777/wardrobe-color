@@ -947,7 +947,7 @@ ${imageBase64 ? "请先观察图中衣物的款式和风格，再结合以上配
             ))}
 
             {/* 生图按钮 */}
-            <button onClick={handleGenerate} disabled={generating||!selectedScheme}
+            <button onClick={()=>handleGenerate()} disabled={generating||!selectedScheme}
               style={{ width:"100%",padding:"11px",borderRadius:T.radiusSm,border:"none",
                 backgroundColor:generating?T.border:T.accent,
                 color:generating?T.textMuted:"#fff",
@@ -1093,7 +1093,7 @@ function WardrobePage({ genPool, setGenPool, settings, onRegenerate }) {
   };
 
   const deleteSelected = () => {
-    if (isProduct) setGenPool(p=>p.filter(i=>!selected.has(i.id)));
+    if (isProduct) setGenPool(p=>{ const next=p.filter(i=>!selected.has(i.id)); savePool(next); return next; });
     else setMaterials(p=>p.filter(i=>!selected.has(i.id)));
     clearSelect();
   };
@@ -1141,7 +1141,7 @@ function WardrobePage({ genPool, setGenPool, settings, onRegenerate }) {
   };
 
   const deleteOne = (item) => {
-    if (isProduct) setGenPool(p=>p.filter(i=>i.id!==item.id));
+    if (isProduct) setGenPool(p=>{ const next=p.filter(i=>i.id!==item.id); savePool(next); return next; });
     else setMaterials(p=>p.filter(i=>i.id!==item.id));
   };
 
@@ -1560,10 +1560,37 @@ function loadSettings() {
 function saveSettings(s) {
   try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(s)); } catch {}
 }
+const POOL_KEY = "wardrobe_pool_v1";
+function loadPool() {
+  try {
+    const s = localStorage.getItem(POOL_KEY);
+    return s ? JSON.parse(s) : [];
+  } catch { return []; }
+}
+function savePool(pool) {
+  // 只存metadata，不存dataUrl（太大），dataUrl单独存
+  try {
+    const slim = pool.map(({dataUrl, ...rest}) => rest);
+    localStorage.setItem(POOL_KEY, JSON.stringify(slim));
+    // dataUrl用独立key存，最多保留最近20张
+    pool.slice(0, 20).forEach((item, i) => {
+      if (item.dataUrl) {
+        try { localStorage.setItem(`pool_img_${item.id}`, item.dataUrl); } catch {}
+      }
+    });
+  } catch {}
+}
+function loadPoolWithImages() {
+  const pool = loadPool();
+  return pool.map(item => ({
+    ...item,
+    dataUrl: (() => { try { return localStorage.getItem(`pool_img_${item.id}`) || null; } catch { return null; } })(),
+  }));
+}
 
 export default function App() {
   const [tab, setTab] = useState("generate");
-  const [genPool, setGenPool] = useState([]);
+  const [genPool, setGenPool] = useState(loadPoolWithImages);
   const [settings, setSettings] = useState(loadSettings);
 
   // ── 搭配页state提升，tab切换不丢失 ──
@@ -1580,7 +1607,11 @@ export default function App() {
   const [genResultImg, setGenResultImg] = useState(null);
 
   const handleSaveToWardrobe = (img) => {
-    setGenPool(prev=>[img,...prev]);
+    setGenPool(prev => {
+      const next = [img, ...prev];
+      savePool(next);
+      return next;
+    });
   };
 
   const handleUpdateMemory = (newMemory) => {
