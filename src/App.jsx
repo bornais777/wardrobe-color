@@ -627,17 +627,14 @@ function GeneratePage({ settings, onSaveToWardrobe, onUpdateMemory, onAddMateria
       return {h:Math.round(h*360),s:Math.round(s*100),l:Math.round(l*100)};
     };
     // 从色块提取颜色描述
-    const nonSkinColors = selectedScheme.colors.filter(c=>c.size!=="lg"&&!c.isRef);
-    const mainC = nonSkinColors.find(c=>c.label.includes("主")||c.size==="md");
-    const secondC = nonSkinColors.filter(c=>c.size==="md"&&c!==mainC)[0];
-    const accentCs = nonSkinColors.filter(c=>c.size==="sm");
     const toName = (hex) => { const {h,s,l}=hexToHSL2(hex); return hslToColorName(h,s,l); };
-    // 硬编码的颜色单品tag
-    const mainTag = mainC ? `${toName(mainC.hex)} top` : "";
-    const bottomTag = secondC ? `${toName(secondC.hex)} pants` : accentCs[0] ? `${toName(accentCs[0].hex)} pants` : "";
-    const acc1Tag = accentCs[0] ? `${toName(accentCs[0].hex)} sneakers` : "";
-    const acc2Tag = accentCs[1] ? `${toName(accentCs[1].hex)} bag` : "";
-    const mandatoryColorTags = [mainTag, bottomTag, acc1Tag, acc2Tag].filter(Boolean).join(", ");
+    // 按顺序分配：跳过肤色和参考色，按实际色块顺序分配单品
+    const usableColors = selectedScheme.colors.filter(c=>c.size!=="lg"&&!c.isRef);
+    const garmentSlots = ["top","pants","sneakers","bag","accessory"];
+    const mandatoryColorTags = usableColors.slice(0,5).map((c,i) =>
+      `${toName(c.hex)} ${garmentSlots[i]||"accessory"}`
+    ).join(", ");
+    console.log("[mandatoryColorTags]", mandatoryColorTags);
 
     const sys = `You are a NovelAI fashion prompt writer.
 I will give you mandatory color+garment tags. Your job is to EXPAND them into a full outfit description.
