@@ -1030,6 +1030,45 @@ ${imageBase64 ? `图中是参考衣物，请识别其款式版型（如：宽松
 }
 
 // ═══════════════════════════════════════════════════════
+// 大图预览弹窗
+// ═══════════════════════════════════════════════════════
+function ImagePreview({ item, onClose }) {
+  if (!item) return null;
+  return (
+    <div style={{ position:"fixed",inset:0,zIndex:400,backgroundColor:"rgba(0,0,0,0.85)",
+      display:"flex",alignItems:"center",justifyContent:"center" }}
+      onClick={onClose}>
+      <div style={{ position:"relative",maxWidth:"92vw",maxHeight:"92vh",
+        display:"flex",flexDirection:"column",alignItems:"center",gap:"10px" }}
+        onClick={e=>e.stopPropagation()}>
+        <button onClick={onClose} style={{
+          position:"absolute",top:"-36px",right:0,
+          background:"none",border:"none",color:"rgba(255,255,255,0.7)",
+          fontSize:"28px",cursor:"pointer",lineHeight:1,padding:"4px",
+        }}>×</button>
+        {item.dataUrl ? (
+          <img src={item.dataUrl} alt="" style={{
+            maxWidth:"92vw",maxHeight:"85vh",objectFit:"contain",
+            borderRadius:"8px",display:"block",
+          }}/>
+        ) : (
+          <div style={{ width:"280px",height:"400px",borderRadius:"8px",
+            backgroundColor:item.color||"#666",
+            display:"flex",alignItems:"center",justifyContent:"center" }}>
+            <span style={{ color:"rgba(255,255,255,0.5)",fontSize:"12px" }}>图片未加载</span>
+          </div>
+        )}
+        {item.schemeName && (
+          <p style={{ color:"rgba(255,255,255,0.6)",fontSize:"11px",margin:0 }}>
+            {item.schemeName}
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════
 // 成品区右键/长按菜单
 // ═══════════════════════════════════════════════════════
 function ContextMenu({ item, pos, onClose, onRegenerate, onDelete, onExport, onViewPrompt, isProduct }) {
@@ -1080,6 +1119,7 @@ function WardrobePage({ genPool, setGenPool, materials, setMaterials, settings, 
   // materials/setMaterials从App层传入
   const [selected, setSelected] = useState(new Set());
   const [contextMenu, setContextMenu] = useState(null); // {item, x, y}
+  const [previewItem, setPreviewItem] = useState(null); // 大图预览
   const [longPressTimer, setLongPressTimer] = useState(null);
   const fileRef = useRef(null);
 
@@ -1106,7 +1146,7 @@ function WardrobePage({ genPool, setGenPool, materials, setMaterials, settings, 
 
   const deleteSelected = () => {
     if (isProduct) setGenPool(p=>{ const next=p.filter(i=>!selected.has(i.id)); savePool(next); return next; });
-    else setMaterials(p=>p.filter(i=>!selected.has(i.id)));
+    else setMaterials(p=>{ const next=p.filter(i=>!selected.has(i.id)); saveMaterials(next); return next; });
     clearSelect();
   };
 
@@ -1154,7 +1194,7 @@ function WardrobePage({ genPool, setGenPool, materials, setMaterials, settings, 
 
   const deleteOne = (item) => {
     if (isProduct) setGenPool(p=>{ const next=p.filter(i=>i.id!==item.id); savePool(next); return next; });
-    else setMaterials(p=>p.filter(i=>i.id!==item.id));
+    else setMaterials(p=>{ const next=p.filter(i=>i.id!==item.id); saveMaterials(next); return next; });
   };
 
   return (
@@ -1214,8 +1254,8 @@ function WardrobePage({ genPool, setGenPool, materials, setMaterials, settings, 
             {items.map(item=>(
               <div key={item.id}
                 style={{ position:"relative",aspectRatio:"3/4",cursor:"pointer" }}
-                onClick={()=>selected.size>0?toggleSelect(item.id):null}
-                onContextMenu={e=>handleContextMenu(e,item)}
+                onClick={()=>selected.size>0?toggleSelect(item.id):setPreviewItem(item)}
+                onContextMenu={e=>{e.preventDefault();handleContextMenu(e,item);}}
                 onTouchStart={e=>handleLongPressStart(e,item)}
                 onTouchEnd={handleLongPressEnd}
                 onTouchMove={handleLongPressEnd}
@@ -1253,6 +1293,9 @@ function WardrobePage({ genPool, setGenPool, materials, setMaterials, settings, 
           </div>
         )}
       </div>
+
+      {/* 大图预览 */}
+      {previewItem && <ImagePreview item={previewItem} onClose={()=>setPreviewItem(null)}/>}
 
       {/* 右键菜单 */}
       {contextMenu && (
@@ -1314,7 +1357,9 @@ function SettingsField({ label, fkey, placeholder, multiline, type, form, setFor
 function SettingsPage({ settings, setSettings }) {
   const [form, setForm] = useState(settings);
   const [saved, setSaved] = useState(false);
-  const [editingPreset, setEditingPreset] = useState(null); // 编辑中的预设id
+  const [showToken, setShowToken] = useState(false);
+  const [editingPreset, setEditingPreset] = useState(null);
+  const [editingPresetData, setEditingPresetData] = useState(null); // {id,name,tags}
   const [newPresetName, setNewPresetName] = useState("");
   const [newPresetTags, setNewPresetTags] = useState("");
 
@@ -1369,7 +1414,23 @@ function SettingsPage({ settings, setSettings }) {
 
       <SettingsSection title="NAI 生图">
         <SettingsField form={form} setForm={setForm} label="中转站 URL" fkey="naiProxyUrl" placeholder="https://std.loliyc.com/api/generate"/>
-        <SettingsField form={form} setForm={setForm} label="Token（STD-xxxxxx）" fkey="naiToken" placeholder="STD-xxxxxxxx"/>
+        {/* Token字段：密码模式+眼睛切换 */}
+        <div style={{ marginBottom:"14px" }}>
+          <p style={{ fontSize:"10px",color:T.textMuted,margin:"0 0 5px",letterSpacing:"0.05em" }}>Token（STD-xxxxxx）</p>
+          <div style={{ position:"relative" }}>
+            <input type={showToken?"text":"password"} value={form.naiToken||""}
+              onChange={e=>setForm(p=>({...p,naiToken:e.target.value}))}
+              placeholder="STD-xxxxxxxx"
+              style={{ width:"100%",padding:"9px 38px 9px 11px",borderRadius:T.radiusSm,
+                border:`1px solid ${T.border}`,backgroundColor:T.bg,
+                fontSize:"11px",color:T.text,outline:"none",boxSizing:"border-box" }}/>
+            <button onClick={()=>setShowToken(v=>!v)} style={{
+              position:"absolute",right:"10px",top:"50%",transform:"translateY(-50%)",
+              background:"none",border:"none",cursor:"pointer",padding:"2px",
+              color:T.textMuted,fontSize:"14px",lineHeight:1,
+            }}>{showToken?"🙈":"👁"}</button>
+          </div>
+        </div>
         <SettingsField form={form} setForm={setForm} label="模型" fkey="naiModel" placeholder="nai-diffusion-4-5-full"/>
         <div style={{ display:"flex",gap:"10px",marginBottom:"14px" }}>
           <div style={{ flex:1 }}>
@@ -1431,20 +1492,54 @@ function SettingsPage({ settings, setSettings }) {
 
       <SettingsSection title="画师串预设">
         {(form.artistPresets||[]).map(preset=>(
-          <div key={preset.id} style={{ marginBottom:"8px",padding:"10px 12px",
-            borderRadius:T.radiusSm,border:`1px solid ${form.activePreset===preset.id?T.accent:T.border}`,
-            backgroundColor:form.activePreset===preset.id?"#fff":T.bg,
-            cursor:"pointer" }}
-            onClick={()=>setForm(p=>({...p,activePreset:preset.id}))}>
-            <div style={{ display:"flex",alignItems:"center",gap:"8px" }}>
-              <span style={{ fontSize:"11px",fontWeight:"600",color:T.text,flex:1 }}>{preset.name}</span>
-              {form.activePreset===preset.id && <span style={{ fontSize:"9px",color:T.accent,
-                backgroundColor:T.accentSoft,padding:"1px 6px",borderRadius:"8px" }}>启用</span>}
-              <button onClick={e=>{e.stopPropagation();deletePreset(preset.id);}} style={{
-                background:"none",border:"none",color:T.textMuted,cursor:"pointer",fontSize:"14px",padding:"2px" }}>×</button>
-            </div>
-            <p style={{ fontSize:"10px",color:T.textMuted,margin:"4px 0 0",lineHeight:1.4,
-              overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap" }}>{preset.tags||"（空）"}</p>
+          <div key={preset.id} style={{ marginBottom:"8px" }}>
+            {editingPreset===preset.id ? (
+              /* 编辑模式 */
+              <div style={{ padding:"12px",border:`1px solid ${T.accent}`,borderRadius:T.radiusSm,
+                backgroundColor:"#fff" }}>
+                <input value={editingPresetData?.name||""} onChange={e=>setEditingPresetData(p=>({...p,name:e.target.value}))}
+                  placeholder="预设名称" style={{ width:"100%",padding:"7px 10px",borderRadius:T.radiusXs,
+                    marginBottom:"8px",border:`1px solid ${T.border}`,backgroundColor:T.bg,
+                    fontSize:"11px",color:T.text,outline:"none",boxSizing:"border-box" }}/>
+                <textarea value={editingPresetData?.tags||""} onChange={e=>setEditingPresetData(p=>({...p,tags:e.target.value}))}
+                  placeholder="画师串 tag，逗号分隔…" rows={4}
+                  style={{ width:"100%",padding:"7px 10px",borderRadius:T.radiusXs,marginBottom:"8px",
+                    border:`1px solid ${T.border}`,backgroundColor:T.bg,fontSize:"11px",
+                    color:T.text,outline:"none",resize:"vertical",boxSizing:"border-box",fontFamily:"inherit" }}/>
+                <div style={{ display:"flex",gap:"8px" }}>
+                  <Btn onClick={()=>{
+                    setForm(p=>({...p,artistPresets:p.artistPresets.map(pr=>
+                      pr.id===preset.id?{...pr,...editingPresetData}:pr)}));
+                    setEditingPreset(null); setEditingPresetData(null);
+                  }} style={{ flex:1,fontSize:"11px",padding:"7px" }}>保存修改</Btn>
+                  <Btn onClick={()=>{setEditingPreset(null);setEditingPresetData(null);}}
+                    variant="ghost" style={{ fontSize:"11px",padding:"7px" }}>取消</Btn>
+                </div>
+              </div>
+            ) : (
+              /* 显示模式 */
+              <div style={{ padding:"10px 12px",borderRadius:T.radiusSm,
+                border:`1px solid ${form.activePreset===preset.id?T.accent:T.border}`,
+                backgroundColor:form.activePreset===preset.id?"#fff":T.bg,cursor:"pointer" }}
+                onClick={()=>setForm(p=>({...p,activePreset:preset.id}))}>
+                <div style={{ display:"flex",alignItems:"center",gap:"8px" }}>
+                  <span style={{ fontSize:"11px",fontWeight:"600",color:T.text,flex:1 }}>{preset.name}</span>
+                  {form.activePreset===preset.id && <span style={{ fontSize:"9px",color:T.accent,
+                    backgroundColor:T.accentSoft,padding:"1px 6px",borderRadius:"8px" }}>启用</span>}
+                  <button onClick={e=>{e.stopPropagation();
+                    setEditingPreset(preset.id);setEditingPresetData({name:preset.name,tags:preset.tags});}}
+                    style={{ background:"none",border:"none",color:T.textMuted,cursor:"pointer",
+                      fontSize:"12px",padding:"2px 4px" }}>编辑</button>
+                  <button onClick={e=>{e.stopPropagation();deletePreset(preset.id);}} style={{
+                    background:"none",border:"none",color:T.textMuted,cursor:"pointer",
+                    fontSize:"14px",padding:"2px" }}>×</button>
+                </div>
+                <p style={{ fontSize:"10px",color:T.textMuted,margin:"4px 0 0",lineHeight:1.4,
+                  overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap" }}>
+                  {preset.tags||"（空）"}
+                </p>
+              </div>
+            )}
           </div>
         ))}
         {/* 新增预设 */}
@@ -1579,18 +1674,38 @@ function loadPool() {
     return s ? JSON.parse(s) : [];
   } catch { return []; }
 }
+// 压缩图片到合理尺寸再存（避免localStorage超限导致黑图）
+async function compressImage(dataUrl, maxW=400, maxH=600, quality=0.75) {
+  return new Promise(res => {
+    const img = new Image();
+    img.onload = () => {
+      const scale = Math.min(1, maxW/img.width, maxH/img.height);
+      const w = Math.round(img.width*scale), h = Math.round(img.height*scale);
+      const canvas = document.createElement("canvas");
+      canvas.width=w; canvas.height=h;
+      canvas.getContext("2d").drawImage(img,0,0,w,h);
+      res(canvas.toDataURL("image/jpeg", quality));
+    };
+    img.onerror = () => res(dataUrl);
+    img.src = dataUrl;
+  });
+}
 function savePool(pool) {
-  // 只存metadata，不存dataUrl（太大），dataUrl单独存
   try {
     const slim = pool.map(({dataUrl, ...rest}) => rest);
     localStorage.setItem(POOL_KEY, JSON.stringify(slim));
-    // dataUrl用独立key存，最多保留最近20张
-    pool.slice(0, 20).forEach((item, i) => {
+    // dataUrl单独存，异步压缩后存
+    pool.slice(0, 20).forEach(item => {
       if (item.dataUrl) {
-        try { localStorage.setItem(`pool_img_${item.id}`, item.dataUrl); } catch {}
+        compressImage(item.dataUrl).then(compressed => {
+          try { localStorage.setItem(`pool_img_${item.id}`, compressed); } catch(e) {
+            // 仍然太大就不存缩略图
+            console.warn("图片存储失败:", e.message);
+          }
+        });
       }
     });
-  } catch {}
+  } catch(e) { console.warn("savePool失败:", e); }
 }
 function loadPoolWithImages() {
   const pool = loadPool();
@@ -1600,6 +1715,34 @@ function loadPoolWithImages() {
   }));
 }
 
+// 材料区存储
+const MATERIALS_KEY = "wardrobe_materials_v1";
+function saveMaterials(materials) {
+  try {
+    const slim = materials.map(({dataUrl, ...rest}) => rest);
+    localStorage.setItem(MATERIALS_KEY, JSON.stringify(slim));
+    materials.slice(0, 50).forEach(item => {
+      if (item.dataUrl) {
+        compressImage(item.dataUrl, 300, 400, 0.7).then(compressed => {
+          try { localStorage.setItem(`mat_img_${item.id}`, compressed); } catch(e) {
+            console.warn("材料图存储失败:", e.message);
+          }
+        });
+      }
+    });
+  } catch(e) { console.warn("saveMaterials失败:", e); }
+}
+function loadMaterials() {
+  try {
+    const s = localStorage.getItem(MATERIALS_KEY);
+    const list = s ? JSON.parse(s) : [];
+    return list.map(item => ({
+      ...item,
+      dataUrl: (() => { try { return localStorage.getItem(`mat_img_${item.id}`) || null; } catch { return null; } })(),
+    }));
+  } catch { return []; }
+}
+
 export default function App() {
   const [tab, setTab] = useState("generate");
   const [genPool, setGenPool] = useState(loadPoolWithImages);
@@ -1607,7 +1750,7 @@ export default function App() {
 
   // ── 搭配页state提升，tab切换不丢失 ──
   const [chatMessages, setChatMessages] = useState([]); // 对话历史跨tab保留
-  const [materials, setMaterials] = useState([]); // 材料区，跨tab保留
+  const [materials, setMaterials] = useState(loadMaterials); // 材料区，持久化
   const [genStep, setGenStep] = useState("upload");
   const [genUploadedImg, setGenUploadedImg] = useState(null);
   const [genExtractedColors, setGenExtractedColors] = useState([]);
@@ -1641,9 +1784,10 @@ export default function App() {
 
   const handleAddMaterial = (item) => {
     setMaterials(prev => {
-      // 避免重复
-      if (prev.find(m => m.dataUrl === item.dataUrl)) return prev;
-      return [item, ...prev];
+      if (prev.find(m => m.name === item.name && m.savedAt === item.savedAt)) return prev;
+      const next = [item, ...prev];
+      saveMaterials(next);
+      return next;
     });
   };
 
