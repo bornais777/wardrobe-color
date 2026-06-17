@@ -603,32 +603,38 @@ function GeneratePage({ settings, onSaveToWardrobe, onUpdateMemory, onAddMateria
       } catch { imageBase64 = null; }
     }
 
-    const sys = `你是精通色彩搭配的穿搭造型师，同时熟悉NovelAI的tag语法。
-任务：根据配色方案和参考衣物，设计一套完整日常穿搭，输出NAI tag串。
+    const sys = `You are a fashion stylist who generates NovelAI image prompts.
+Output ONLY a comma-separated English tag string. No explanations, no numbering, no markdown.
 
-【强制要求——必须全部满足】
-1. 构图：full body standing, white background——人物必须从头到脚完整出现
-2. 每个色块必须对应具体单品：
-   - 主色（最大面积）→ 上衣或外套的颜色，写成"[颜色] [具体单品]"，如"rose pink zip-up hoodie"
-   - 次要色（中等面积）→ 下装的颜色，写成"[颜色] [具体下装]"，如"sage green wide-leg pants"
-   - 点缀色① → 配件或细节，如"gray canvas sneakers"
-   - 点缀色② → 小配件，如"orange bucket hat"或腰带/包/耳饰
-3. 下装必须出现：pants / skirt / shorts / trousers 中的一个，且带颜色前缀
-4. 风格：real clothing, everyday wear, street fashion——禁止奇幻、礼服、古风
+RULES:
+- Must include: full body, standing, white background, fashion photography, real clothing, everyday wear, street fashion
+- Map each color to a specific clothing item using "[color adjective] [garment]" format
+- Main color (largest area) → top garment (e.g. "caramel brown oversized hoodie")
+- Secondary color → bottom garment (e.g. "sage green wide-leg pants") — REQUIRED
+- Accent color 1 → shoes or bag (e.g. "yellow sneakers")
+- Accent color 2 → small accessory (e.g. "teal earrings")
+- Include silhouette tags: oversized / fitted / layered / high-waisted
+- Include material tags: cotton / denim / knit / linen
+- NO fantasy, NO gown, NO ancient style, NO formal wear
+- Total: 25-40 tags`;
 
-输出格式：只输出英文tag串，逗号分隔，不加解释。
-必含tag：full body, standing, white background, fashion photography, real clothing, everyday wear
-总计25-40个tag。`;
-
-    const userMsg = `${colorStructure}
-
-用户审美偏好：${settings.aestheticDesc||"无特别偏好"}
-
-${imageBase64 ? `图中是参考衣物，请识别其款式版型（如：宽松卫衣/修身外套/针织衫…），
-将其作为主色对应的上衣单品，再根据配色方案补全下装和配件。` : `（未上传衣物图）请严格按照上方色块分配设计穿搭。
-警告：主色是${selectedColor?.hex||""}，这个颜色必须出现在最大面积单品上，不得替换成其他颜色。`}
-
-按照色块分配规则，输出NAI tag串：`;
+    const colorLines = selectedScheme.colors.map(c => {
+      const role = c.size==="lg" ? "skin tone (reference only)" :
+                   c.label.includes("主") ? "MAIN COLOR - largest garment" :
+                   c.size==="md" ? "secondary color - medium area" : "accent color - small detail";
+      return `  ${role}: ${c.hex} (${c.label})${c.isRef?" [reference direction]":""}`;
+    }).join("\n");
+    const schemeStyleEn = {A:"monochrome black/white/gray",B:"analogous with small accent",
+      C:"muted split-complementary",D:"near-complementary soft",E:"high-saturation bold"};
+    const mainHex = selectedColor?.hex || "";
+    const userMsg = `COLOR SCHEME: ${selectedScheme?.name||""} — ${schemeStyleEn[selectedScheme?.id]||""}
+COLOR ASSIGNMENTS:
+${colorLines}
+User preference: ${settings.aestheticDesc||"none"}
+${imageBase64
+  ? "The image shows the reference garment. Identify its silhouette, use it as the main color top, add matching bottom and accessories."
+  : `No image. STRICTLY use color assignments. Main color ${mainHex} MUST appear on the largest garment. Do NOT substitute.`}
+Output the NAI tag string now:`;
 
     const rawAiTags = (await callLLM({
       settings,
