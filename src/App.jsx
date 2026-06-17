@@ -17,36 +17,47 @@ const T = {
 // ═══════════════════════════════════════════════════════
 // 统一 LLM 调用（支持 Anthropic 原生 + OpenAI 兼容接口）
 // ═══════════════════════════════════════════════════════
-async function callLLM({ settings, system, userContent, maxTokens = 1000 }) {
-  const mode = settings.llmMode || "anthropic"; // "anthropic" | "openai"
+async function callLLM({ settings, system, userContent, maxTokens = 1000, imageBase64 = null, imageMime = "image/jpeg" }) {
+  const mode = settings.llmMode || "anthropic";
   const model = settings.llmModel || "claude-sonnet-4-6";
 
   if (mode === "openai") {
-    // OpenAI 兼容格式（适用于第三方中转、本地模型等）
+    // OpenAI 兼容格式（Gemini Flash等均支持vision）
     const baseUrl = (settings.llmBaseUrl || "https://api.openai.com").replace(/\/$/, "");
     const apiKey = settings.llmApiKey || "";
     const msgs = [];
     if (system) msgs.push({ role: "system", content: system });
-    msgs.push({ role: "user", content: userContent });
+    // 有图片时构建多模态content
+    if (imageBase64) {
+      msgs.push({ role: "user", content: [
+        { type: "image_url", image_url: { url: `data:${imageMime};base64,${imageBase64}` } },
+        { type: "text", text: userContent },
+      ]});
+    } else {
+      msgs.push({ role: "user", content: userContent });
+    }
     const resp = await fetch(`${baseUrl}/v1/chat/completions`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${apiKey}`,
-      },
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
       body: JSON.stringify({ model, max_tokens: maxTokens, messages: msgs }),
     });
     const data = await resp.json();
     return data.choices?.[0]?.message?.content || "";
   } else {
-    // Anthropic 原生格式
+    // Anthropic 原生格式（支持vision）
+    const userMsg = imageBase64
+      ? [
+          { type: "image", source: { type: "base64", media_type: imageMime, data: imageBase64 } },
+          { type: "text", text: userContent },
+        ]
+      : userContent;
     const resp = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         model, max_tokens: maxTokens,
         ...(system ? { system } : {}),
-        messages: [{ role: "user", content: userContent }],
+        messages: [{ role: "user", content: userMsg }],
       }),
     });
     const data = await resp.json();
@@ -255,26 +266,49 @@ function matchSchemes(mainColor, skinTone) {
   ];
 }
 
-// 配色方案→NAI色彩描述
-function schemeToColorTags(scheme, mainColor) {
-  const hue = mainColor.h;
-  const hueNames = [
+// 配色方案→结构化色块文本（直接给AI看，不再抽象）
+function schemeToStructuredText(scheme, skinTone) {
+  const HUE_NAMES = [
     [15,"red"],[45,"orange"],[75,"yellow"],[105,"yellow-green"],
     [135,"green"],[165,"teal"],[195,"cyan"],[225,"blue"],
     [255,"blue-violet"],[285,"violet"],[315,"pink"],[345,"rose"],[360,"red"]
   ];
-  const getHueName = (h) => hueNames.find(([deg]) => h <= deg)?.[1] || "neutral";
-  const mainHueName = getHueName(hue);
-  const satDesc = mainColor.s > 60 ? "vivid" : mainColor.s > 30 ? "muted" : "desaturated";
-  const lightDesc = mainColor.l > 70 ? "light" : mainColor.l > 40 ? "medium" : "dark";
-  const schemeDescs = {
-    A: `${satDesc} ${mainHueName}, monochrome palette, black and white accents, achromatic coordination`,
-    B: `${satDesc} ${mainHueName}, analogous color scheme, subtle tonal variation, small accent details`,
-    C: `desaturated ${mainHueName}, split-complementary colors, muted contrast, sophisticated gray tones`,
-    D: `${mainHueName} with near-complementary accent, controlled tension, soft contrast coordination`,
-    E: `bold ${mainHueName}, high-saturation complementary colors, strong color contrast, vibrant coordination`,
+  const hueName = (h) => HUE_NAMES.find(([deg]) => ((h%360+360)%360) <= deg)?.[1] || "neutral";
+  const lightName = (l) => l > 75 ? "light" : l > 45 ? "medium" : "dark";
+  const satName = (s) => s > 60 ? "vivid" : s > 25 ? "muted" : "pale/desaturated";
+
+  const colorDesc = (c) => {
+    const isRef = c.isRef;
+    const role = c.size === "lg" ? "skin tone reference" :
+                 c.size === "md" ? (c.label.includes("主") ? "main color (largest area)" : "secondary color (medium area)") :
+                 "accent/detail color (small area)";
+    const rgb = { r: parseInt(c.hex.slice(1,3),16), g: parseInt(c.hex.slice(3,5),16), b: parseInt(c.hex.slice(5,7),16) };
+    const hsl = (() => {
+      let r=rgb.r/255,g=rgb.g/255,b=rgb.b/255;
+      const max=Math.max(r,g,b),min=Math.min(r,g,b);
+      let h=0,s,l=(max+min)/2;
+      if(max!==min){const d=max-min;s=l>0.5?d/(2-max-min):d/(max+min);
+        switch(max){case r:h=((g-b)/d+(g<b?6:0))/6;break;case g:h=((b-r)/d+2)/6;break;case b:h=((r-g)/d+4)/6;break;}}
+      else s=0;
+      return {h:Math.round(h*360),s:Math.round(s*100),l:Math.round(l*100)};
+    })();
+    return `  - ${c.label}（${role}）: ${c.hex}, ${lightName(hsl.l)} ${satName(hsl.s)} ${hueName(hsl.h)}${isRef?" [参考色，可购入方向]":""}`;
   };
-  return schemeDescs[scheme.id] || `${mainHueName} color coordination`;
+
+  const schemeStyle = {
+    A: "无彩色系，强调廓形与质感，任何肤色友好",
+    B: "临近色调和，主色+低饱临近+高饱小点缀，层次丰富",
+    C: "对比色双低饱和，灰调碰撞，高级故事感",
+    D: "临近互补微调，有对比感但不强烈，张力可控",
+    E: "高饱和直接对撞，视觉冲击强，对肤色要求高",
+  };
+
+  return `配色方案：${scheme.name}
+方案逻辑：${schemeStyle[scheme.id]||""}
+${scheme.warning ? `注意：${scheme.warning}` : ""}
+肤色：${skinTone.hex}（${skinTone.label}，${skinTone.isWarm?"暖色系":"冷/中性"}）
+
+色块分配：\n${scheme.colors.map(colorDesc).join("\n")}`;
 }
 
 // ═══════════════════════════════════════════════════════
@@ -476,6 +510,8 @@ function GeneratePage({ settings, onSaveToWardrobe, onUpdateMemory, chatMessages
 }) {
   const [chatOpen, setChatOpen] = useState(false);
   const [saveFeedback, setSaveFeedback] = useState(false);
+  const [showPromptEdit, setShowPromptEdit] = useState(false);
+  const [editingPrompt, setEditingPrompt] = useState("");
   const fileRef = useRef(null);
   const resultRef = useRef(null);
 
@@ -525,36 +561,72 @@ function GeneratePage({ settings, onSaveToWardrobe, onUpdateMemory, chatMessages
     setStep("scheme");
   };
 
-  // 文字AI生成NAI prompt
+  // 文字AI生成NAI prompt（含读图 + 结构化配色）
   const buildPromptViaAI = async (scheme, mainColor) => {
-    const colorDesc = schemeToColorTags(scheme, mainColor);
     const artistPre = settings.artistPresets?.find(p=>p.id===settings.activePreset);
     const artistTags = artistPre ? artistPre.tags : "";
     const negTags = settings.negative || "";
 
-    // 直接用Claude API生成prompt
-    const sys = `你是NovelAI穿搭图生成专家。根据配色方案生成英文tag串。
-规则：
-- 只输出英文tag串，逗号分隔，不要任何解释
-- 必须包含：1girl, full body, fashion, outfit, white background
-- 根据配色描述加入对应颜色tag（如 blue dress, white shirt等）
-- 加入穿搭风格tag：如 casual, streetwear, minimalist, layering等
-- 20-35个tag，不要重复`;
+    // 结构化色块文本
+    const colorStructure = schemeToStructuredText(scheme, selectedSkin);
+
+    // 读图：把上传的衣服图转base64
+    let imageBase64 = null;
+    let imageMime = "image/jpeg";
+    if (uploadedImg?.url && !uploadedImg.mockName) {
+      try {
+        const imgResp = await fetch(uploadedImg.url);
+        const blob = await imgResp.blob();
+        imageMime = blob.type || "image/jpeg";
+        imageBase64 = await new Promise(res => {
+          const fr = new FileReader();
+          fr.onload = () => res(fr.result.split(",")[1]);
+          fr.readAsDataURL(blob);
+        });
+      } catch { imageBase64 = null; }
+    }
+
+    const sys = `你是精通色彩搭配的穿搭造型师，同时熟悉NovelAI的tag语法。
+你的任务：根据用户上传的衣物图片和配色方案，设计一套完整的日常穿搭，转成NAI tag串。
+
+思考框架（内部思考，不输出）：
+1. 图中衣物是什么款式、版型、风格定位？（如：宽松oversize卫衣、修身西装外套…）
+2. 这件衣物适合搭配什么下装/外层？什么廓形最平衡？
+3. 按色块分配：主色→最大面积单品颜色，次要色→搭配单品颜色，点缀色→配件/腰带/细节
+4. 整体风格是否日常可穿？避免奇幻礼服等脱离现实的方向
+
+输出规则：
+- 只输出英文tag串，逗号分隔，不要任何解释或序号
+- 必须包含：1girl, full body, white background, fashion photography, real clothing, everyday wear
+- 必须体现色块分配（如 white shirt, blue wide-leg pants, orange accessories）
+- 廓形tag（如 oversized, fitted, layered, high-waisted）
+- 服装材质/细节tag（如 cotton, linen, denim, silk, knit）
+- 25-40个tag，不重复`;
+
+    const userMsg = `${colorStructure}
+
+用户审美偏好：${settings.aestheticDesc||"无特别偏好"}
+
+${imageBase64 ? "请先观察图中衣物的款式和风格，再结合以上配色方案设计完整搭配。" : "（未上传衣物图，请根据配色方案自行设计穿搭）"}
+请输出NAI tag串：`;
 
     const aiTags = (await callLLM({
       settings,
       system: sys,
-      userContent: `配色方案：${scheme.name}\n色彩描述：${colorDesc}\n用户审美偏好：${settings.aestheticDesc||""}`,
-      maxTokens: 500,
-    })).trim() || "1girl, full body, fashion, white background";
-    // 组合：前置画师串 + AI生成 + 后置
+      userContent: userMsg,
+      maxTokens: 600,
+      imageBase64,
+      imageMime,
+    })).trim() || "1girl, full body, fashion photography, white background, everyday wear";
+
     const finalTag = [artistTags, aiTags].filter(Boolean).join(", ");
     return { tag: finalTag, negative: negTags };
   };
 
-  const handleGenerate = async () => {
+  const handleGenerate = async (overrideTag = null) => {
     if (!selectedScheme) return;
-    setGenerating(true); setGenProgress("文字AI组装prompt…"); setResultImg(null);
+    setGenerating(true); setGenProgress(overrideTag?"使用自定义prompt…":"文字AI组装prompt…"); setResultImg(null);
+    setShowPromptEdit(false);
 
     // mock模式：无token时用占位渐变色块验证流程
     if (!settings.naiToken) {
@@ -589,8 +661,14 @@ function GeneratePage({ settings, onSaveToWardrobe, onUpdateMemory, chatMessages
     }
 
     try {
-      // 1. 生成prompt
-      const { tag, negative } = await buildPromptViaAI(selectedScheme, selectedColor.hsl);
+      // 1. 生成prompt（或使用用户编辑的）
+      let tag, negative;
+      if (overrideTag) {
+        tag = overrideTag;
+        negative = settings.negative || "";
+      } else {
+        ({ tag, negative } = await buildPromptViaAI(selectedScheme, selectedColor.hsl));
+      }
       setGenProgress("发送至NAI生成中…");
 
       // 2. 调NAI中转（SSE流式）
@@ -889,13 +967,40 @@ function GeneratePage({ settings, onSaveToWardrobe, onUpdateMemory, chatMessages
               boxShadow:T.shadowMd,marginBottom:"10px" }}>
               <img src={resultImg.dataUrl} alt="生成图" style={{ width:"100%",display:"block" }}/>
             </div>
+            {/* prompt查看/编辑 */}
+            {showPromptEdit ? (
+              <div style={{ marginBottom:"10px" }}>
+                <p style={{ fontSize:"10px",color:T.textMuted,margin:"0 0 4px" }}>NAI Prompt（可编辑后重新生成）</p>
+                <textarea value={editingPrompt} onChange={e=>setEditingPrompt(e.target.value)}
+                  rows={5} style={{ width:"100%",padding:"9px 11px",borderRadius:T.radiusSm,
+                    border:`1px solid ${T.border}`,backgroundColor:T.bg,fontSize:"10px",
+                    color:T.text,outline:"none",resize:"vertical",boxSizing:"border-box",
+                    fontFamily:"monospace",lineHeight:1.5 }}/>
+                <div style={{ display:"flex",gap:"6px",marginTop:"6px" }}>
+                  <Btn onClick={()=>handleGenerate(editingPrompt)} style={{ flex:1,fontSize:"11px",padding:"7px" }}>
+                    用此prompt重新生成
+                  </Btn>
+                  <Btn onClick={()=>setShowPromptEdit(false)} variant="ghost" style={{ fontSize:"11px",padding:"7px" }}>
+                    关闭
+                  </Btn>
+                </div>
+              </div>
+            ) : (
+              <button onClick={()=>{setEditingPrompt(resultImg.prompt);setShowPromptEdit(true);}}
+                style={{ width:"100%",padding:"7px",borderRadius:T.radiusSm,marginBottom:"8px",
+                  border:`1px solid ${T.border}`,backgroundColor:T.surface,
+                  fontSize:"10px",color:T.textMuted,cursor:"pointer",textAlign:"left",
+                  overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap" }}>
+                ✎ {resultImg.prompt?.slice(0,60)}…
+              </button>
+            )}
             <div style={{ display:"flex",gap:"8px" }}>
               <Btn onClick={()=>setChatOpen(true)} variant="ghost" style={{ flex:1 }}>💬 问char</Btn>
               <Btn onClick={handleSave} style={{ flex:1,
                 backgroundColor:saveFeedback?"#5a8a5a":T.accent }}>
                 {saveFeedback?"✓ 已存入":"存入衣橱"}
               </Btn>
-              <Btn onClick={handleGenerate} variant="ghost" style={{ padding:"9px 12px" }}>↺</Btn>
+              <Btn onClick={()=>handleGenerate()} variant="ghost" style={{ padding:"9px 12px" }}>↺</Btn>
             </div>
           </div>
         )}
