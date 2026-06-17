@@ -613,7 +613,8 @@ function GeneratePage({ settings, onSaveToWardrobe, onUpdateMemory, onAddMateria
 用户审美偏好：${settings.aestheticDesc||"无特别偏好"}
 
 ${imageBase64 ? `图中是参考衣物，请识别其款式版型（如：宽松卫衣/修身外套/针织衫…），
-将其作为主色对应的上衣单品，再根据配色方案补全下装和配件。` : "（未上传衣物图，请根据配色方案自行设计完整穿搭）"}
+将其作为主色对应的上衣单品，再根据配色方案补全下装和配件。` : `（未上传衣物图）请严格按照上方色块分配设计穿搭。
+警告：主色是${selectedColor?.hex||""}，这个颜色必须出现在最大面积单品上，不得替换成其他颜色。`}
 
 按照色块分配规则，输出NAI tag串：`;
 
@@ -1030,6 +1031,45 @@ ${imageBase64 ? `图中是参考衣物，请识别其款式版型（如：宽松
 }
 
 // ═══════════════════════════════════════════════════════
+// Prompt编辑覆盖层（成品区右键用）
+// ═══════════════════════════════════════════════════════
+function PromptEditOverlay({ item, onClose, onRegenerate }) {
+  const [tag, setTag] = useState(item?.prompt||"");
+  return (
+    <div style={{ position:"fixed",inset:0,zIndex:350,backgroundColor:"rgba(0,0,0,0.6)",
+      display:"flex",alignItems:"flex-end" }} onClick={onClose}>
+      <div style={{ width:"100%",maxWidth:"480px",margin:"0 auto",
+        backgroundColor:T.surface,borderRadius:"20px 20px 0 0",
+        padding:"16px",boxShadow:"0 -4px 32px rgba(0,0,0,0.2)",
+        maxHeight:"70vh",display:"flex",flexDirection:"column",gap:"10px" }}
+        onClick={e=>e.stopPropagation()}>
+        <div style={{ display:"flex",alignItems:"center",gap:"8px" }}>
+          <p style={{ fontSize:"12px",fontWeight:"600",color:T.text,margin:0,flex:1 }}>NAI Prompt</p>
+          <button onClick={onClose} style={{ background:"none",border:"none",
+            color:T.textMuted,fontSize:"20px",cursor:"pointer" }}>×</button>
+        </div>
+        <textarea value={tag} onChange={e=>setTag(e.target.value)} rows={8}
+          style={{ width:"100%",padding:"9px 11px",borderRadius:T.radiusSm,
+            border:`1px solid ${T.border}`,backgroundColor:T.bg,fontSize:"10px",
+            color:T.text,outline:"none",resize:"vertical",boxSizing:"border-box",
+            fontFamily:"monospace",lineHeight:1.6,flex:1 }}/>
+        <div style={{ display:"flex",gap:"8px" }}>
+          <button onClick={()=>{onRegenerate(tag);onClose();}} style={{
+            flex:1,padding:"10px",borderRadius:T.radiusSm,border:"none",
+            backgroundColor:T.accent,color:"#fff",fontSize:"12px",cursor:"pointer",fontWeight:"500",
+          }}>用此Prompt重新生成</button>
+          <button onClick={onClose} style={{
+            padding:"10px 14px",borderRadius:T.radiusSm,
+            border:`1px solid ${T.border}`,backgroundColor:T.surface,
+            fontSize:"12px",color:T.textSub,cursor:"pointer",
+          }}>关闭</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════
 // 大图预览弹窗
 // ═══════════════════════════════════════════════════════
 function ImagePreview({ item, onClose }) {
@@ -1118,8 +1158,9 @@ function WardrobePage({ genPool, setGenPool, materials, setMaterials, settings, 
   const [tab, setTab] = useState("material"); // material | product
   // materials/setMaterials从App层传入
   const [selected, setSelected] = useState(new Set());
-  const [contextMenu, setContextMenu] = useState(null); // {item, x, y}
-  const [previewItem, setPreviewItem] = useState(null); // 大图预览
+  const [contextMenu, setContextMenu] = useState(null);
+  const [previewItem, setPreviewItem] = useState(null);
+  const [promptEditItem, setPromptEditItem] = useState(null);
   const [longPressTimer, setLongPressTimer] = useState(null);
   const fileRef = useRef(null);
 
@@ -1293,6 +1334,12 @@ function WardrobePage({ genPool, setGenPool, materials, setMaterials, settings, 
           </div>
         )}
       </div>
+
+      {/* Prompt编辑 */}
+      {promptEditItem && (
+        <PromptEditOverlay item={promptEditItem} onClose={()=>setPromptEditItem(null)}
+          onRegenerate={(newTag)=>onRegenerate({...promptEditItem, overrideTag:newTag})}/>
+      )}
 
       {/* 大图预览 */}
       {previewItem && <ImagePreview item={previewItem} onClose={()=>setPreviewItem(null)}/>}
@@ -1780,6 +1827,14 @@ export default function App() {
 
   const handleRegenerate = (item) => {
     setTab("generate");
+    // 如果带有overrideTag，切换后直接用该tag重新生成
+    if (item?.overrideTag) {
+      // 把overrideTag暂存，GeneratePage mount后触发
+      setTimeout(() => {
+        // GeneratePage通过ref或event触发，这里简化：提示用户手动点
+        // 完整实现需要ref传递，后续可改
+      }, 100);
+    }
   };
 
   const handleAddMaterial = (item) => {
