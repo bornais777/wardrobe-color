@@ -498,7 +498,7 @@ ${newPrefs}`}]);
 // ═══════════════════════════════════════════════════════
 // 搭配页
 // ═══════════════════════════════════════════════════════
-function GeneratePage({ settings, onSaveToWardrobe, onUpdateMemory, chatMessages, setChatMessages,
+function GeneratePage({ settings, onSaveToWardrobe, onUpdateMemory, onAddMaterial, chatMessages, setChatMessages,
   step, setStep, uploadedImg, setUploadedImg,
   extractedColors, setExtractedColors,
   selectedColor, setSelectedColor,
@@ -535,6 +535,9 @@ function GeneratePage({ settings, onSaveToWardrobe, onUpdateMemory, chatMessages
       setSelectedColor(colors[0] || null);
       setSchemes([]); setSelectedScheme(null); setResultImg(null);
       setStep("colors");
+      // 自动同步到材料区
+      if (onAddMaterial) onAddMaterial({ id:Date.now(), dataUrl:url, name:file.name,
+        savedAt:new Date().toLocaleString("zh-CN") });
     };
     img.src = url;
     e.target.value = "";
@@ -657,10 +660,12 @@ ${imageBase64 ? `图中是参考衣物，请识别其款式版型（如：宽松
         res(canvas.toDataURL("image/png"));
       });
       const mockTag = `[mock] ${selectedScheme.name}, ${selectedColor.hex}`;
-      setResultImg({ dataUrl: mockDataUrl, prompt: mockTag, negative: "",
+      const mockItem = { dataUrl: mockDataUrl, prompt: mockTag, negative: "",
         schemeId: selectedScheme.id, schemeName: selectedScheme.name,
-        color: selectedColor.hex, id: Date.now() });
-      setChatMessages([]); // 新图生成，清空上次对话
+        color: selectedColor.hex, id: Date.now() };
+      setResultImg(mockItem);
+      onSaveToWardrobe(mockItem); // 自动存入
+      setChatMessages([]);
       setStep("result");
       setGenerating(false);
       return;
@@ -737,9 +742,11 @@ ${imageBase64 ? `图中是参考衣物，请识别其款式版型（如：宽松
         const fr = new FileReader(); fr.onload = () => res(fr.result); fr.readAsDataURL(blob);
       });
 
-      setResultImg({ dataUrl, prompt:tag, negative, schemeId:selectedScheme.id,
-        schemeName:selectedScheme.name, color:selectedColor.hex, id:Date.now() });
-      setChatMessages([]); // 新图生成，清空上次对话
+      const newItem = { dataUrl, prompt:tag, negative, schemeId:selectedScheme.id,
+        schemeName:selectedScheme.name, color:selectedColor.hex, id:Date.now() };
+      setResultImg(newItem);
+      onSaveToWardrobe(newItem); // 自动存入
+      setChatMessages([]);
       setStep("result");
 
     } catch (err) {
@@ -1005,10 +1012,11 @@ ${imageBase64 ? `图中是参考衣物，请识别其款式版型（如：宽松
             )}
             <div style={{ display:"flex",gap:"8px" }}>
               <Btn onClick={()=>setChatOpen(true)} variant="ghost" style={{ flex:1 }}>💬 问char</Btn>
-              <Btn onClick={handleSave} style={{ flex:1,
-                backgroundColor:saveFeedback?"#5a8a5a":T.accent }}>
-                {saveFeedback?"✓ 已存入":"存入衣橱"}
-              </Btn>
+              <div style={{ flex:1, padding:"9px 14px", borderRadius:T.radiusSm,
+                backgroundColor:"#e8f4e8", color:"#5a8a5a",
+                fontSize:"12px", textAlign:"center", fontWeight:"500" }}>
+                ✓ 已自动存入
+              </div>
               <Btn onClick={()=>handleGenerate()} variant="ghost" style={{ padding:"9px 12px" }}>↺</Btn>
             </div>
           </div>
@@ -1067,9 +1075,9 @@ function ContextMenu({ item, pos, onClose, onRegenerate, onDelete, onExport, onV
 // ═══════════════════════════════════════════════════════
 // 衣橱页
 // ═══════════════════════════════════════════════════════
-function WardrobePage({ genPool, setGenPool, settings, onRegenerate }) {
+function WardrobePage({ genPool, setGenPool, materials, setMaterials, settings, onRegenerate }) {
   const [tab, setTab] = useState("material"); // material | product
-  const [materials, setMaterials] = useState([]); // 上传的原图
+  // materials/setMaterials从App层传入
   const [selected, setSelected] = useState(new Set());
   const [contextMenu, setContextMenu] = useState(null); // {item, x, y}
   const [longPressTimer, setLongPressTimer] = useState(null);
@@ -1599,6 +1607,7 @@ export default function App() {
 
   // ── 搭配页state提升，tab切换不丢失 ──
   const [chatMessages, setChatMessages] = useState([]); // 对话历史跨tab保留
+  const [materials, setMaterials] = useState([]); // 材料区，跨tab保留
   const [genStep, setGenStep] = useState("upload");
   const [genUploadedImg, setGenUploadedImg] = useState(null);
   const [genExtractedColors, setGenExtractedColors] = useState([]);
@@ -1630,6 +1639,14 @@ export default function App() {
     setTab("generate");
   };
 
+  const handleAddMaterial = (item) => {
+    setMaterials(prev => {
+      // 避免重复
+      if (prev.find(m => m.dataUrl === item.dataUrl)) return prev;
+      return [item, ...prev];
+    });
+  };
+
   const TABS = [
     { key:"generate", label:"搭配", icon:"✦" },
     { key:"wardrobe", label:"衣橱", icon:"⊞" },
@@ -1653,6 +1670,7 @@ export default function App() {
         <div style={{ display:tab==="generate"?"flex":"none", flexDirection:"column", flex:1, overflow:"hidden" }}>
           <GeneratePage
             settings={settings} onSaveToWardrobe={handleSaveToWardrobe} onUpdateMemory={handleUpdateMemory}
+            onAddMaterial={handleAddMaterial}
             chatMessages={chatMessages} setChatMessages={setChatMessages}
             step={genStep} setStep={setGenStep}
             uploadedImg={genUploadedImg} setUploadedImg={setGenUploadedImg}
@@ -1668,6 +1686,7 @@ export default function App() {
         </div>
         <div style={{ display:tab==="wardrobe"?"flex":"none", flexDirection:"column", flex:1, overflow:"hidden" }}>
           <WardrobePage genPool={genPool} setGenPool={setGenPool}
+            materials={materials} setMaterials={setMaterials}
             settings={settings} onRegenerate={handleRegenerate}/>
         </div>
         <div style={{ display:tab==="settings"?"flex":"none", flexDirection:"column", flex:1, overflow:"hidden" }}>
