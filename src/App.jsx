@@ -636,18 +636,21 @@ function GeneratePage({ settings, onSaveToWardrobe, onUpdateMemory, onAddMateria
     ).join(", ");
     console.log("[mandatoryColorTags]", mandatoryColorTags);
 
+    // 强制色块拆成数组，每个单品独立保留
+    const mandatoryArr = mandatoryColorTags.split(",").map(s=>s.trim()).filter(Boolean);
+    const garmentCount = mandatoryArr.length;
+
     const sys = `You are a NovelAI fashion prompt writer.
-I will give you mandatory color+garment tags. Your job is to EXPAND them into a full outfit description.
-Add: specific garment style (hoodie/coat/skirt/jeans etc), silhouette (oversized/fitted/high-waisted), material (cotton/denim/knit), styling details, and required base tags.
-Do NOT change the colors. Output ONLY a comma-separated English tag string, 25-40 tags total.
-Required base tags to include: 1girl, full body, standing, white background, fashion photography, real clothing, everyday wear, street fashion
+You will receive a list of MANDATORY "color + garment" tags (e.g. "dark muted green top, muted violet pants, light gray sneakers").
+The list has ${garmentCount} garments. You MUST write style tags for EVERY one of them — never stop after the first garment.
+For EACH garment add 2-4 extra tags: specific style (hoodie/coat/skirt/jeans/sneakers/bag etc), silhouette (oversized/fitted/high-waisted), material (cotton/denim/knit/leather), and one styling detail.
+Keep the given colors EXACTLY as written. Output ONLY a comma-separated English tag string. No sentences, no markdown, no explanation.
 NO fantasy, NO gown, NO ancient costume.`;
 
-    const mainHex = selectedColor?.hex || "";
-    const userMsg = `Mandatory outfit tags (DO NOT change these colors): ${mandatoryColorTags}
-${imageBase64 ? "Reference image shows the main garment style — keep the silhouette, expand the outfit." : ""}
+    const userMsg = `Mandatory garments (${garmentCount} items — you must describe ALL of them, in order): ${mandatoryColorTags}
+${imageBase64 ? "A reference image shows the main garment style — keep its silhouette, then expand the rest of the outfit." : ""}
 User style preference: ${settings.aestheticDesc||"casual everyday"}
-Expand into a full 25-40 tag NAI prompt string:`;
+Write the comma-separated style tags now (cover every garment):`;
 
     const rawAiTags = (await callLLM({
       settings,
@@ -658,11 +661,31 @@ Expand into a full 25-40 tag NAI prompt string:`;
       imageMime,
     })).trim();
     console.log("[buildPromptViaAI] AI完整返回:", rawAiTags);
-    setGenProgress(rawAiTags ? `AI: ${rawAiTags.slice(0,80)}…` : "⚠️ AI返回为空");
-    await new Promise(r=>setTimeout(r,2000));
-    const aiTags = rawAiTags || "1girl, full body, standing, white background, fashion photography, real clothing, everyday wear";
+    setGenProgress(rawAiTags ? `AI: ${rawAiTags.slice(0,80)}…` : "⚠️ AI返回为空（已用硬编码颜色兜底）");
+    await new Promise(r=>setTimeout(r,1200));
 
-    // 画师串放最后，AI生成的tag已经包含构图词
+    // ── 确定性拼装：强制色块永远在最前，AI只负责补充风格词 ──
+    // 这样即使 AI 漏掉颜色、只展开第一个单品、或整体返回空，
+    // 每个色块的「颜色+单品」都一定出现在最终 prompt 里。
+    const aiArr   = rawAiTags.split(",").map(s=>s.trim()).filter(Boolean);
+    const baseTags = ["1girl","full body","standing","white background",
+      "fashion photography","real clothing","everyday wear","street fashion"];
+
+    const seen = new Set();
+    const merged = [];
+    const pushTag = (t) => {
+      const key = t.toLowerCase();
+      if (!t || seen.has(key)) return;
+      seen.add(key); merged.push(t);
+    };
+    mandatoryArr.forEach(pushTag); // ① 强制颜色单品（最高优先级）
+    aiArr.forEach(pushTag);        // ② AI 补充的风格/材质/廓形词
+    baseTags.forEach(pushTag);     // ③ 必备构图基础词
+
+    const aiTags = merged.join(", ");
+    console.log("[buildPromptViaAI] 最终拼装tag:", aiTags);
+
+    // 画师串放最后
     const finalTag = [aiTags, artistTags].filter(Boolean).join(", ");
     return { tag: finalTag, negative: negTags };
   };
@@ -1249,12 +1272,39 @@ function WardrobePage({ genPool, setGenPool, materials, setMaterials, settings, 
   };
 
   const packAll = async () => {
-    // 简化：逐张下载（完整版可用JSZip打包）
-    for (const item of genPool) {
-      if (!item.dataUrl) continue;
+    // 取全分辨率原图：内存里有就用，没有就从 IndexedDB 补
+    const targets = [];
+    for (const it of genPool) {
+      let url = it.dataUrl;
+      if (!url) { try { url = (await idbGet(it.id))?.dataUrl || null; } catch {} }
+      if (url) targets.push({ id: it.id, url });
+    }
+    if (!targets.length) return;
+    try {
+      // GitHub Pages 静态部署，运行时从 CDN 动态加载 JSZip
+      const mod = await import(/* @vite-ignore */ "https://esm.sh/jszip@3.10.1");
+      const JSZip = mod.default || mod;
+      const zip = new JSZip();
+      targets.forEach((it, idx) => {
+        const m = /^data:(image\/[\w.+-]+);base64,(.+)$/.exec(it.url);
+        const ext = m ? m[1].split("/")[1].replace("jpeg","jpg") : "png";
+        const b64 = m ? m[2] : (it.url.split(",")[1] || "");
+        if (b64) zip.file(`nai_${String(idx+1).padStart(3,"0")}_${it.id}.${ext}`, b64, { base64:true });
+      });
+      const blob = await zip.generateAsync({ type:"blob" });
       const a = document.createElement("a");
-      a.href = item.dataUrl; a.download = `nai_${item.id}.png`; a.click();
-      await new Promise(r=>setTimeout(r,300));
+      a.href = URL.createObjectURL(blob);
+      a.download = `wardrobe_${Date.now()}.zip`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 8000);
+    } catch (e) {
+      // CDN 不可用时退回逐张下载
+      console.warn("JSZip打包失败，改为逐张下载:", e);
+      for (const it of targets) {
+        const a = document.createElement("a");
+        a.href = it.url; a.download = `nai_${it.id}.png`; a.click();
+        await new Promise(r => setTimeout(r, 300));
+      }
     }
   };
 
@@ -1720,6 +1770,23 @@ function SettingsPage({ settings, setSettings }) {
           placeholder="如：日系街拍、宽松廓形、低饱和莫兰迪色系…" multiline/>
       </SettingsSection>
 
+      <SettingsSection title="图片存储">
+        <div style={{ marginBottom:"10px" }}>
+          <p style={{ fontSize:"10px",color:T.textMuted,margin:"0 0 5px",letterSpacing:"0.05em" }}>生成图保留期限</p>
+          <select value={form.poolRetention||"1m"} onChange={e=>setForm(p=>({...p,poolRetention:e.target.value}))}
+            style={{ width:"100%",padding:"9px 11px",borderRadius:T.radiusSm,
+              border:`1px solid ${T.border}`,backgroundColor:T.bg,
+              fontSize:"11px",color:T.text,outline:"none" }}>
+            <option value="1w">保留一周</option>
+            <option value="1m">保留一个月</option>
+            <option value="forever">永久保留</option>
+          </select>
+          <p style={{ fontSize:"10px",color:T.textMuted,margin:"6px 0 0",lineHeight:1.5 }}>
+            原图存在浏览器 IndexedDB（刷新不丢、全分辨率）。超过期限的图会在下次打开时自动清理。衣橱里可「打包下载」为 zip。
+          </p>
+        </div>
+      </SettingsSection>
+
       <SettingsSection title="Char 角色卡 & 记忆">
         <SettingsField form={form} setForm={setForm} label="角色设定（JSON或纯文本）" fkey="charCard" placeholder="粘贴角色卡内容…" multiline/>
         <SettingsField form={form} setForm={setForm} label="偏好记忆" fkey="memory"
@@ -1749,6 +1816,7 @@ const DEFAULT_SETTINGS = {
   artistPresets:[], activePreset:null,
   llmMode:"anthropic", llmBaseUrl:"", llmApiKey:"", llmModel:"claude-sonnet-4-6",
   aestheticDesc:"", charCard:"", memory:"",
+  poolRetention:"1m", // 衣橱生成图保留期限：1w / 1m / forever
 };
 function loadSettings() {
   try {
@@ -1760,11 +1828,101 @@ function saveSettings(s) {
   try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(s)); } catch {}
 }
 const POOL_KEY = "wardrobe_pool_v1";
+
+// ═══ IndexedDB：存生成图原图（全分辨率，不压缩，刷新不丢）═══
+const IDB_NAME = "wardrobeDB", IDB_STORE = "images";
+function idbOpen() {
+  return new Promise((res, rej) => {
+    const req = indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(IDB_STORE)) db.createObjectStore(IDB_STORE, { keyPath:"id" });
+    };
+    req.onsuccess = () => res(req.result);
+    req.onerror = () => rej(req.error);
+  });
+}
+async function idbPut(id, dataUrl, savedAt) {
+  const db = await idbOpen();
+  return new Promise((res, rej) => {
+    const tx = db.transaction(IDB_STORE, "readwrite");
+    tx.objectStore(IDB_STORE).put({ id, dataUrl, savedAt });
+    tx.oncomplete = () => res(); tx.onerror = () => rej(tx.error);
+  });
+}
+async function idbGet(id) {
+  const db = await idbOpen();
+  return new Promise((res, rej) => {
+    const tx = db.transaction(IDB_STORE, "readonly");
+    const r = tx.objectStore(IDB_STORE).get(id);
+    r.onsuccess = () => res(r.result || null); r.onerror = () => rej(r.error);
+  });
+}
+async function idbGetAll() {
+  const db = await idbOpen();
+  return new Promise((res, rej) => {
+    const tx = db.transaction(IDB_STORE, "readonly");
+    const r = tx.objectStore(IDB_STORE).getAll();
+    r.onsuccess = () => res(r.result || []); r.onerror = () => rej(r.error);
+  });
+}
+async function idbGetAllKeys() {
+  const db = await idbOpen();
+  return new Promise((res, rej) => {
+    const tx = db.transaction(IDB_STORE, "readonly");
+    const r = tx.objectStore(IDB_STORE).getAllKeys();
+    r.onsuccess = () => res(r.result || []); r.onerror = () => rej(r.error);
+  });
+}
+async function idbDelete(id) {
+  const db = await idbOpen();
+  return new Promise((res, rej) => {
+    const tx = db.transaction(IDB_STORE, "readwrite");
+    tx.objectStore(IDB_STORE).delete(id);
+    tx.oncomplete = () => res(); tx.onerror = () => rej(tx.error);
+  });
+}
+
+// 仅读元数据（同步，给 useState 初始化用，图片随后异步补上）
 function loadPool() {
   try {
     const s = localStorage.getItem(POOL_KEY);
     return s ? JSON.parse(s) : [];
   } catch { return []; }
+}
+
+// 保留期限清理：删掉超过期限的原图 + 对应元数据
+const RETENTION_MS = { "1w": 7*86400000, "1m": 30*86400000 };
+async function cleanupExpiredImages(retention) {
+  if (!retention || retention === "forever") return;
+  const span = RETENTION_MS[retention]; if (!span) return;
+  const cutoff = Date.now() - span;
+  try {
+    const all = await idbGetAll();
+    const expired = all.filter(r => (r.savedAt || 0) < cutoff).map(r => r.id);
+    if (!expired.length) return;
+    for (const id of expired) { try { await idbDelete(id); } catch {} }
+    const meta = loadPool().filter(i => !expired.includes(i.id));
+    localStorage.setItem(POOL_KEY, JSON.stringify(meta.map(({dataUrl, ...r}) => r)));
+    console.log(`[retention] 清理过期图 ${expired.length} 张`);
+  } catch (e) { console.warn("retention清理失败:", e); }
+}
+
+// 把元数据列表补上 IndexedDB 里的原图（异步）；顺带迁移旧版缩略图
+async function hydratePoolImages(metaList) {
+  const out = [];
+  for (const item of metaList) {
+    let dataUrl = null;
+    try { dataUrl = (await idbGet(item.id))?.dataUrl || null; } catch {}
+    if (!dataUrl) {
+      try {
+        const old = localStorage.getItem(`pool_img_${item.id}`);
+        if (old) { dataUrl = old; await idbPut(item.id, old, item.savedAt || item.id || Date.now()); }
+      } catch {}
+    }
+    out.push({ ...item, dataUrl });
+  }
+  return out;
 }
 // 压缩图片到合理尺寸再存（避免localStorage超限导致黑图）
 async function compressImage(dataUrl, maxW=400, maxH=600, quality=0.75) {
@@ -1783,28 +1941,31 @@ async function compressImage(dataUrl, maxW=400, maxH=600, quality=0.75) {
   });
 }
 function savePool(pool) {
+  // 元数据存 localStorage（同步、保序、刷新后布局立刻在）
   try {
-    const slim = pool.map(({dataUrl, ...rest}) => rest);
+    const slim = pool.map(({dataUrl, ...rest}) => ({
+      ...rest, savedAt: rest.savedAt || rest.id || Date.now(),
+    }));
     localStorage.setItem(POOL_KEY, JSON.stringify(slim));
-    // dataUrl单独存，异步压缩后存
-    pool.slice(0, 20).forEach(item => {
-      if (item.dataUrl) {
-        compressImage(item.dataUrl).then(compressed => {
-          try { localStorage.setItem(`pool_img_${item.id}`, compressed); } catch(e) {
-            // 仍然太大就不存缩略图
-            console.warn("图片存储失败:", e.message);
-          }
-        });
-      }
-    });
-  } catch(e) { console.warn("savePool失败:", e); }
+  } catch(e) { console.warn("savePool元数据失败:", e); }
+
+  // 原图（全分辨率 dataUrl）存 IndexedDB，不压缩
+  pool.forEach(item => {
+    if (item.dataUrl) {
+      idbPut(item.id, item.dataUrl, item.savedAt || item.id || Date.now())
+        .catch(e => console.warn("idbPut失败:", e));
+    }
+  });
+
+  // 协调删除：IDB 里不在当前 pool 的图清掉（处理手动删除的项）
+  idbGetAllKeys().then(keys => {
+    const valid = new Set(pool.map(i => i.id));
+    keys.forEach(k => { if (!valid.has(k)) idbDelete(k).catch(()=>{}); });
+  }).catch(()=>{});
 }
+// 同步返回元数据（dataUrl 先为 null）；原图由 App 挂载后 hydratePoolImages 异步补上
 function loadPoolWithImages() {
-  const pool = loadPool();
-  return pool.map(item => ({
-    ...item,
-    dataUrl: (() => { try { return localStorage.getItem(`pool_img_${item.id}`) || null; } catch { return null; } })(),
-  }));
+  return loadPool().map(item => ({ ...item, dataUrl: null }));
 }
 
 // 材料区存储
@@ -1839,6 +2000,16 @@ export default function App() {
   const [tab, setTab] = useState("generate");
   const [genPool, setGenPool] = useState(loadPoolWithImages);
   const [settings, setSettings] = useState(loadSettings);
+
+  // 挂载后：按保留期限清理过期图，再从 IndexedDB 把原图补回内存
+  useEffect(() => {
+    (async () => {
+      await cleanupExpiredImages(settings.poolRetention || "1m");
+      const withImages = await hydratePoolImages(loadPool());
+      setGenPool(withImages);
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // ── 搭配页state提升，tab切换不丢失 ──
   const [chatMessages, setChatMessages] = useState([]); // 对话历史跨tab保留
