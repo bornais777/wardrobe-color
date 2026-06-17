@@ -1166,6 +1166,30 @@ function SettingsPage({ settings, setSettings }) {
       activePreset:p.activePreset===id?null:p.activePreset }));
   };
 
+  const [modelList, setModelList] = useState([]);
+  const [fetchingModels, setFetchingModels] = useState(false);
+  const [modelFetchStatus, setModelFetchStatus] = useState(""); // "" | "ok" | "err"
+
+  const fetchModels = async () => {
+    const baseUrl = (form.llmBaseUrl||"").replace(/\/$/, "");
+    const apiKey = form.llmApiKey||"";
+    if (!baseUrl || !apiKey) { setModelFetchStatus("err"); setModelList([]); return; }
+    setFetchingModels(true); setModelFetchStatus("");
+    try {
+      const resp = await fetch(`${baseUrl}/v1/models`, {
+        headers: { "Authorization": `Bearer ${apiKey}` },
+      });
+      const data = await resp.json();
+      const ids = (data.data||[]).map(m=>m.id).filter(Boolean).sort();
+      setModelList(ids);
+      setModelFetchStatus(ids.length>0?"ok":"err");
+      if (ids.length>0 && !form.llmModel) setForm(p=>({...p,llmModel:ids[0]}));
+    } catch {
+      setModelFetchStatus("err"); setModelList([]);
+    }
+    setFetchingModels(false);
+  };
+
   const Field = ({ label, fkey, placeholder, multiline, type }) => (
     <div style={{ marginBottom:"14px" }}>
       <p style={{ fontSize:"10px",color:T.textMuted,margin:"0 0 5px",letterSpacing:"0.05em" }}>{label}</p>
@@ -1285,8 +1309,37 @@ function SettingsPage({ settings, setSettings }) {
           </>
         )}
 
-        <Field label="模型名" fkey="llmModel"
-          placeholder={form.llmMode==="openai"?"gpt-4o / deepseek-chat / …":"claude-sonnet-4-6"}/>
+        {/* 模型名：OpenAI模式下可拉取列表 */}
+        <div style={{ marginBottom:"14px" }}>
+          <div style={{ display:"flex",alignItems:"center",gap:"8px",marginBottom:"5px" }}>
+            <p style={{ fontSize:"10px",color:T.textMuted,margin:0,letterSpacing:"0.05em",flex:1 }}>模型名</p>
+            {form.llmMode==="openai" && (
+              <button onClick={fetchModels} disabled={fetchingModels} style={{
+                padding:"3px 8px",borderRadius:"6px",border:`1px solid ${T.border}`,
+                backgroundColor:T.bg,fontSize:"10px",color:T.textSub,cursor:"pointer",
+              }}>
+                {fetchingModels?"拉取中…":"拉取模型列表"}
+              </button>
+            )}
+            {modelFetchStatus==="ok" && <span style={{ fontSize:"10px",color:"#5a8a5a" }}>✓ {modelList.length}个</span>}
+            {modelFetchStatus==="err" && <span style={{ fontSize:"10px",color:T.warn }}>✗ 失败</span>}
+          </div>
+          {modelList.length>0 && form.llmMode==="openai" ? (
+            <select value={form.llmModel||""}
+              onChange={e=>setForm(p=>({...p,llmModel:e.target.value}))}
+              style={{ width:"100%",padding:"9px 11px",borderRadius:T.radiusSm,
+                border:`1px solid ${T.border}`,backgroundColor:T.bg,
+                fontSize:"11px",color:T.text,outline:"none" }}>
+              {modelList.map(id=><option key={id} value={id}>{id}</option>)}
+            </select>
+          ) : (
+            <input value={form.llmModel||""} onChange={e=>setForm(p=>({...p,llmModel:e.target.value}))}
+              placeholder={form.llmMode==="openai"?"gpt-4o / deepseek-chat / …":"claude-sonnet-4-6"}
+              style={{ width:"100%",padding:"9px 11px",borderRadius:T.radiusSm,
+                border:`1px solid ${T.border}`,backgroundColor:T.bg,
+                fontSize:"11px",color:T.text,outline:"none",boxSizing:"border-box" }}/>
+          )}
+        </div>
         <Field label="审美偏好描述（辅助prompt生成）" fkey="aestheticDesc"
           placeholder="如：日系街拍、宽松廓形、低饱和莫兰迪色系…" multiline/>
       </Section>
