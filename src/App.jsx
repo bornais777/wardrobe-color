@@ -324,13 +324,21 @@ function SectionLabel({ children }) {
 // ═══════════════════════════════════════════════════════
 // 对话弹窗
 // ═══════════════════════════════════════════════════════
-function ChatModal({ imageItem, onClose, settings, onUpdateMemory }) {
-  const [msgs, setMsgs] = useState([{
-    role:"assistant",
-    content: settings.charCard
-      ? "这套搭配方案出来了，我来帮你看看。"
-      : "这套搭配出来了，你觉得怎么样？",
-  }]);
+function ChatModal({ imageItem, onClose, settings, onUpdateMemory, messages, setMessages }) {
+  // messages/setMessages由外部传入，关闭再打开历史不丢
+  const msgs = messages;
+  const setMsgs = setMessages;
+  // 首次打开时若为空则加初始消息
+  useEffect(() => {
+    if (msgs.length === 0) {
+      setMsgs([{
+        role:"assistant",
+        content: settings.charCard
+          ? "这套搭配方案出来了，我来帮你看看。"
+          : "这套搭配出来了，你觉得怎么样？",
+      }]);
+    }
+  }, []);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const bottomRef = useRef(null);
@@ -455,7 +463,7 @@ ${newPrefs}`}]);
 // ═══════════════════════════════════════════════════════
 // 搭配页
 // ═══════════════════════════════════════════════════════
-function GeneratePage({ settings, onSaveToWardrobe, onUpdateMemory,
+function GeneratePage({ settings, onSaveToWardrobe, onUpdateMemory, chatMessages, setChatMessages,
   step, setStep, uploadedImg, setUploadedImg,
   extractedColors, setExtractedColors,
   selectedColor, setSelectedColor,
@@ -574,6 +582,7 @@ function GeneratePage({ settings, onSaveToWardrobe, onUpdateMemory,
       setResultImg({ dataUrl: mockDataUrl, prompt: mockTag, negative: "",
         schemeId: selectedScheme.id, schemeName: selectedScheme.name,
         color: selectedColor.hex, id: Date.now() });
+      setChatMessages([]); // 新图生成，清空上次对话
       setStep("result");
       setGenerating(false);
       return;
@@ -640,6 +649,7 @@ function GeneratePage({ settings, onSaveToWardrobe, onUpdateMemory,
 
       setResultImg({ dataUrl, prompt:tag, negative, schemeId:selectedScheme.id,
         schemeName:selectedScheme.name, color:selectedColor.hex, id:Date.now() });
+      setChatMessages([]); // 新图生成，清空上次对话
       setStep("result");
 
     } catch (err) {
@@ -885,7 +895,7 @@ function GeneratePage({ settings, onSaveToWardrobe, onUpdateMemory,
         )}
       </div>
 
-      {chatOpen && <ChatModal imageItem={resultImg} onClose={()=>setChatOpen(false)} settings={settings} onUpdateMemory={onUpdateMemory}/>}
+      {chatOpen && <ChatModal imageItem={resultImg} onClose={()=>setChatOpen(false)} settings={settings} onUpdateMemory={onUpdateMemory} messages={chatMessages} setMessages={setChatMessages}/>}
       <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
     </div>
   );
@@ -1141,6 +1151,38 @@ ${p}`);
 // ═══════════════════════════════════════════════════════
 // 设置页
 // ═══════════════════════════════════════════════════════
+// 设置页专用：提取到外部避免每次render重建导致输入框跳位
+function SettingsSection({ title, children }) {
+  return (
+    <div style={{ backgroundColor:T.surface,border:`1px solid ${T.border}`,
+      borderRadius:T.radius,padding:"16px",marginBottom:"12px" }}>
+      <p style={{ fontSize:"12px",fontWeight:"600",color:T.text,margin:"0 0 14px" }}>{title}</p>
+      {children}
+    </div>
+  );
+}
+function SettingsField({ label, fkey, placeholder, multiline, type, form, setForm }) {
+  return (
+    <div style={{ marginBottom:"14px" }}>
+      <p style={{ fontSize:"10px",color:T.textMuted,margin:"0 0 5px",letterSpacing:"0.05em" }}>{label}</p>
+      {multiline ? (
+        <textarea value={form[fkey]||""} onChange={e=>setForm(p=>({...p,[fkey]:e.target.value}))}
+          placeholder={placeholder} rows={3}
+          style={{ width:"100%",padding:"9px 11px",borderRadius:T.radiusSm,
+            border:`1px solid ${T.border}`,backgroundColor:T.bg,
+            fontSize:"11px",color:T.text,outline:"none",resize:"vertical",
+            boxSizing:"border-box",fontFamily:"inherit" }}/>
+      ) : (
+        <input type={type||"text"} value={form[fkey]||""} onChange={e=>setForm(p=>({...p,[fkey]:e.target.value}))}
+          placeholder={placeholder}
+          style={{ width:"100%",padding:"9px 11px",borderRadius:T.radiusSm,
+            border:`1px solid ${T.border}`,backgroundColor:T.bg,
+            fontSize:"11px",color:T.text,outline:"none",boxSizing:"border-box" }}/>
+      )}
+    </div>
+  );
+}
+
 function SettingsPage({ settings, setSettings }) {
   const [form, setForm] = useState(settings);
   const [saved, setSaved] = useState(false);
@@ -1190,40 +1232,14 @@ function SettingsPage({ settings, setSettings }) {
     setFetchingModels(false);
   };
 
-  const Field = ({ label, fkey, placeholder, multiline, type }) => (
-    <div style={{ marginBottom:"14px" }}>
-      <p style={{ fontSize:"10px",color:T.textMuted,margin:"0 0 5px",letterSpacing:"0.05em" }}>{label}</p>
-      {multiline ? (
-        <textarea value={form[fkey]||""} onChange={e=>setForm(p=>({...p,[fkey]:e.target.value}))}
-          placeholder={placeholder} rows={3}
-          style={{ width:"100%",padding:"9px 11px",borderRadius:T.radiusSm,
-            border:`1px solid ${T.border}`,backgroundColor:T.bg,
-            fontSize:"11px",color:T.text,outline:"none",resize:"vertical",
-            boxSizing:"border-box",fontFamily:"inherit" }}/>
-      ) : (
-        <input type={type||"text"} value={form[fkey]||""} onChange={e=>setForm(p=>({...p,[fkey]:e.target.value}))}
-          placeholder={placeholder}
-          style={{ width:"100%",padding:"9px 11px",borderRadius:T.radiusSm,
-            border:`1px solid ${T.border}`,backgroundColor:T.bg,
-            fontSize:"11px",color:T.text,outline:"none",boxSizing:"border-box" }}/>
-      )}
-    </div>
-  );
 
-  const Section = ({ title, children }) => (
-    <div style={{ backgroundColor:T.surface,border:`1px solid ${T.border}`,
-      borderRadius:T.radius,padding:"16px",marginBottom:"12px" }}>
-      <p style={{ fontSize:"12px",fontWeight:"600",color:T.text,margin:"0 0 14px" }}>{title}</p>
-      {children}
-    </div>
-  );
 
   return (
     <div style={{ overflowY:"auto",padding:"16px",height:"100%",boxSizing:"border-box" }}>
 
-      <Section title="NAI 生图">
-        <Field label="中转 Token（STD-xxxxxx）" fkey="naiToken" placeholder="STD-xxxxxxxx"/>
-        <Field label="模型" fkey="naiModel" placeholder="nai-diffusion-4-5-full"/>
+      <SettingsSection title="NAI 生图">
+        <SettingsField form={form} setForm={setForm} label="中转 Token（STD-xxxxxx）" fkey="naiToken" placeholder="STD-xxxxxxxx"/>
+        <SettingsField form={form} setForm={setForm} label="模型" fkey="naiModel" placeholder="nai-diffusion-4-5-full"/>
         <div style={{ marginBottom:"14px" }}>
           <p style={{ fontSize:"10px",color:T.textMuted,margin:"0 0 5px" }}>尺寸预设</p>
           <select value={form.naiSize||"竖图"}
@@ -1236,11 +1252,11 @@ function SettingsPage({ settings, setSettings }) {
             ))}
           </select>
         </div>
-        <Field label="Negative Prompt" fkey="negative"
+        <SettingsField form={form} setForm={setForm} label="Negative Prompt" fkey="negative"
           placeholder="lowres, worst quality, bad anatomy, text, watermark…" multiline/>
-      </Section>
+      </SettingsSection>
 
-      <Section title="画师串预设">
+      <SettingsSection title="画师串预设">
         {(form.artistPresets||[]).map(preset=>(
           <div key={preset.id} style={{ marginBottom:"8px",padding:"10px 12px",
             borderRadius:T.radiusSm,border:`1px solid ${form.activePreset===preset.id?T.accent:T.border}`,
@@ -1282,9 +1298,9 @@ function SettingsPage({ settings, setSettings }) {
             border:`1.5px dashed ${T.border}`,backgroundColor:"transparent",
             fontSize:"11px",color:T.textMuted,cursor:"pointer" }}>+ 新增画师串预设</button>
         )}
-      </Section>
+      </SettingsSection>
 
-      <Section title="文字 AI">
+      <SettingsSection title="文字 AI">
         {/* 接口模式切换 */}
         <div style={{ marginBottom:"14px" }}>
           <p style={{ fontSize:"10px",color:T.textMuted,margin:"0 0 6px",letterSpacing:"0.05em" }}>接口类型</p>
@@ -1304,8 +1320,8 @@ function SettingsPage({ settings, setSettings }) {
         {/* OpenAI兼容模式额外字段 */}
         {(form.llmMode==="openai") && (
           <>
-            <Field label="Base URL" fkey="llmBaseUrl" placeholder="https://api.openai.com 或第三方地址"/>
-            <Field label="API Key" fkey="llmApiKey" placeholder="sk-xxxxxxx 或第三方key" type="password"/>
+            <SettingsField form={form} setForm={setForm} label="Base URL" fkey="llmBaseUrl" placeholder="https://api.openai.com 或第三方地址"/>
+            <SettingsField form={form} setForm={setForm} label="API Key" fkey="llmApiKey" placeholder="sk-xxxxxxx 或第三方key" type="password"/>
           </>
         )}
 
@@ -1340,15 +1356,15 @@ function SettingsPage({ settings, setSettings }) {
                 fontSize:"11px",color:T.text,outline:"none",boxSizing:"border-box" }}/>
           )}
         </div>
-        <Field label="审美偏好描述（辅助prompt生成）" fkey="aestheticDesc"
+        <SettingsField form={form} setForm={setForm} label="审美偏好描述（辅助prompt生成）" fkey="aestheticDesc"
           placeholder="如：日系街拍、宽松廓形、低饱和莫兰迪色系…" multiline/>
-      </Section>
+      </SettingsSection>
 
-      <Section title="Char 角色卡 & 记忆">
-        <Field label="角色设定（JSON或纯文本）" fkey="charCard" placeholder="粘贴角色卡内容…" multiline/>
-        <Field label="偏好记忆" fkey="memory"
+      <SettingsSection title="Char 角色卡 & 记忆">
+        <SettingsField form={form} setForm={setForm} label="角色设定（JSON或纯文本）" fkey="charCard" placeholder="粘贴角色卡内容…" multiline/>
+        <SettingsField form={form} setForm={setForm} label="偏好记忆" fkey="memory"
           placeholder="宽松廓形 / 不喜欢高饱和红 / 倾向方案B…" multiline/>
-      </Section>
+      </SettingsSection>
 
       <button onClick={save} style={{ width:"100%",padding:"11px",borderRadius:T.radiusSm,
         border:"none",backgroundColor:saved?"#5a8a5a":T.accent,
@@ -1375,6 +1391,7 @@ export default function App() {
   });
 
   // ── 搭配页state提升，tab切换不丢失 ──
+  const [chatMessages, setChatMessages] = useState([]); // 对话历史跨tab保留
   const [genStep, setGenStep] = useState("upload");
   const [genUploadedImg, setGenUploadedImg] = useState(null);
   const [genExtractedColors, setGenExtractedColors] = useState([]);
@@ -1421,6 +1438,7 @@ export default function App() {
         <div style={{ display:tab==="generate"?"flex":"none", flexDirection:"column", flex:1, overflow:"hidden" }}>
           <GeneratePage
             settings={settings} onSaveToWardrobe={handleSaveToWardrobe} onUpdateMemory={handleUpdateMemory}
+            chatMessages={chatMessages} setChatMessages={setChatMessages}
             step={genStep} setStep={setGenStep}
             uploadedImg={genUploadedImg} setUploadedImg={setGenUploadedImg}
             extractedColors={genExtractedColors} setExtractedColors={setGenExtractedColors}
