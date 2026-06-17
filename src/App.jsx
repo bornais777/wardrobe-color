@@ -595,18 +595,24 @@ function GeneratePage({ settings, onSaveToWardrobe, onUpdateMemory, chatMessages
 
       // 2. 调NAI中转（SSE流式）
       const size = settings.naiSize || "竖图";
+      const proxyUrl = (settings.naiProxyUrl || "https://std.loliyc.com/api/generate").trim();
       const reqBody = {
         token: settings.naiToken,
         model: settings.naiModel || "nai-diffusion-4-5-full",
-        sampler: "k_euler_ancestral",
-        noise_schedule: "karras",
-        cfg: "0", scale: "5", steps: "28",
+        sampler: settings.naiSampler || "k_dpmpp_2m",
+        noise_schedule: settings.naiNoiseSchedule || "karras",
+        cfg: settings.naiCfg || "0",
+        scale: settings.naiScale || "5",
+        steps: settings.naiSteps || "28",
         seed: -1, size, stream: 1, nocache: 1,
         tag, negative,
         addition: { imageToImageBase64:null, vibeTransferList:[], multiRoleList:[], characterKeep:null },
       };
 
-      const resp = await fetch("https://std.loliyc.com/api/generate", {
+      // 中转站URL里如果imageUrl相对路径，需要取base
+      const proxyBase = proxyUrl.replace(/\/api\/generate.*$/, "").replace(/\/api$/, "");
+
+      const resp = await fetch(proxyUrl, {
         method:"POST",
         headers:{ "Authorization":`Bearer ${settings.naiToken}`, "Content-Type":"application/json" },
         body:JSON.stringify(reqBody),
@@ -631,7 +637,7 @@ function GeneratePage({ settings, onSaveToWardrobe, onUpdateMemory, chatMessages
             const obj = JSON.parse(l);
             if (obj.status === "wait") setGenProgress(obj.data || "排队中…");
             if (obj.status === "success" && obj.url) {
-              imageUrl = obj.url.startsWith("http") ? obj.url : "https://std.loliyc.com" + obj.url;
+              imageUrl = obj.url.startsWith("http") ? obj.url : proxyBase + obj.url;
             }
           } catch {}
         }
@@ -1240,8 +1246,51 @@ function SettingsPage({ settings, setSettings }) {
     <div style={{ overflowY:"auto",padding:"16px",height:"100%",boxSizing:"border-box" }}>
 
       <SettingsSection title="NAI 生图">
-        <SettingsField form={form} setForm={setForm} label="中转 Token（STD-xxxxxx）" fkey="naiToken" placeholder="STD-xxxxxxxx"/>
+        <SettingsField form={form} setForm={setForm} label="中转站 URL" fkey="naiProxyUrl" placeholder="https://std.loliyc.com/api/generate"/>
+        <SettingsField form={form} setForm={setForm} label="Token（STD-xxxxxx）" fkey="naiToken" placeholder="STD-xxxxxxxx"/>
         <SettingsField form={form} setForm={setForm} label="模型" fkey="naiModel" placeholder="nai-diffusion-4-5-full"/>
+        <div style={{ display:"flex",gap:"10px",marginBottom:"14px" }}>
+          <div style={{ flex:1 }}>
+            <p style={{ fontSize:"10px",color:T.textMuted,margin:"0 0 5px" }}>采样器</p>
+            <select value={form.naiSampler||"k_dpmpp_2m"} onChange={e=>setForm(p=>({...p,naiSampler:e.target.value}))}
+              style={{ width:"100%",padding:"9px 11px",borderRadius:T.radiusSm,
+                border:`1px solid ${T.border}`,backgroundColor:T.bg,fontSize:"11px",color:T.text,outline:"none" }}>
+              {["k_dpmpp_2m","k_euler_ancestral","k_euler","k_dpmpp_sde","k_dpmpp_2s_ancestral"].map(s=>(
+                <option key={s} value={s}>{s}</option>
+              ))}
+            </select>
+          </div>
+          <div style={{ flex:1 }}>
+            <p style={{ fontSize:"10px",color:T.textMuted,margin:"0 0 5px" }}>Noise Schedule</p>
+            <select value={form.naiNoiseSchedule||"karras"} onChange={e=>setForm(p=>({...p,naiNoiseSchedule:e.target.value}))}
+              style={{ width:"100%",padding:"9px 11px",borderRadius:T.radiusSm,
+                border:`1px solid ${T.border}`,backgroundColor:T.bg,fontSize:"11px",color:T.text,outline:"none" }}>
+              {["karras","exponential","polyexponential","native"].map(s=>(
+                <option key={s} value={s}>{s}</option>
+              ))}
+            </select>
+          </div>
+        </div>
+        <div style={{ display:"flex",gap:"10px",marginBottom:"14px" }}>
+          <div style={{ flex:1 }}>
+            <p style={{ fontSize:"10px",color:T.textMuted,margin:"0 0 5px" }}>Steps</p>
+            <input type="number" value={form.naiSteps||"28"} onChange={e=>setForm(p=>({...p,naiSteps:e.target.value}))}
+              style={{ width:"100%",padding:"9px 11px",borderRadius:T.radiusSm,
+                border:`1px solid ${T.border}`,backgroundColor:T.bg,fontSize:"11px",color:T.text,outline:"none",boxSizing:"border-box" }}/>
+          </div>
+          <div style={{ flex:1 }}>
+            <p style={{ fontSize:"10px",color:T.textMuted,margin:"0 0 5px" }}>Scale（引导强度）</p>
+            <input type="number" value={form.naiScale||"5"} onChange={e=>setForm(p=>({...p,naiScale:e.target.value}))}
+              style={{ width:"100%",padding:"9px 11px",borderRadius:T.radiusSm,
+                border:`1px solid ${T.border}`,backgroundColor:T.bg,fontSize:"11px",color:T.text,outline:"none",boxSizing:"border-box" }}/>
+          </div>
+          <div style={{ flex:1 }}>
+            <p style={{ fontSize:"10px",color:T.textMuted,margin:"0 0 5px" }}>CFG Rescale</p>
+            <input type="number" value={form.naiCfg||"0"} step="0.1" onChange={e=>setForm(p=>({...p,naiCfg:e.target.value}))}
+              style={{ width:"100%",padding:"9px 11px",borderRadius:T.radiusSm,
+                border:`1px solid ${T.border}`,backgroundColor:T.bg,fontSize:"11px",color:T.text,outline:"none",boxSizing:"border-box" }}/>
+          </div>
+        </div>
         <div style={{ marginBottom:"14px" }}>
           <p style={{ fontSize:"10px",color:T.textMuted,margin:"0 0 5px" }}>尺寸预设</p>
           <select value={form.naiSize||"竖图"}
@@ -1383,7 +1432,10 @@ function SettingsPage({ settings, setSettings }) {
 // ═══════════════════════════════════════════════════════
 const SETTINGS_KEY = "wardrobe_settings_v1";
 const DEFAULT_SETTINGS = {
-  naiToken:"", naiModel:"nai-diffusion-4-5-full", naiSize:"竖图",
+  naiToken:"", naiProxyUrl:"https://std.loliyc.com/api/generate",
+  naiModel:"nai-diffusion-4-5-full", naiSize:"竖图",
+  naiSampler:"k_dpmpp_2m", naiNoiseSchedule:"karras",
+  naiScale:"5", naiSteps:"28", naiCfg:"0",
   negative:"lowres, worst quality, bad anatomy, text, watermark, signature",
   artistPresets:[], activePreset:null,
   llmMode:"anthropic", llmBaseUrl:"", llmApiKey:"", llmModel:"claude-sonnet-4-6",
