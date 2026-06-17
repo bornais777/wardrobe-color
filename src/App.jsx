@@ -1191,7 +1191,9 @@ function SettingsPage({ settings, setSettings }) {
   const [newPresetTags, setNewPresetTags] = useState("");
 
   const save = () => {
-    setSettings(form); setSaved(true);
+    setSettings(form);
+    saveSettings(form);
+    setSaved(true);
     setTimeout(()=>setSaved(false),1800);
   };
 
@@ -1379,16 +1381,28 @@ function SettingsPage({ settings, setSettings }) {
 // ═══════════════════════════════════════════════════════
 // 主 App
 // ═══════════════════════════════════════════════════════
+const SETTINGS_KEY = "wardrobe_settings_v1";
+const DEFAULT_SETTINGS = {
+  naiToken:"", naiModel:"nai-diffusion-4-5-full", naiSize:"竖图",
+  negative:"lowres, worst quality, bad anatomy, text, watermark, signature",
+  artistPresets:[], activePreset:null,
+  llmMode:"anthropic", llmBaseUrl:"", llmApiKey:"", llmModel:"claude-sonnet-4-6",
+  aestheticDesc:"", charCard:"", memory:"",
+};
+function loadSettings() {
+  try {
+    const s = localStorage.getItem(SETTINGS_KEY);
+    return s ? { ...DEFAULT_SETTINGS, ...JSON.parse(s) } : DEFAULT_SETTINGS;
+  } catch { return DEFAULT_SETTINGS; }
+}
+function saveSettings(s) {
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(s)); } catch {}
+}
+
 export default function App() {
   const [tab, setTab] = useState("generate");
   const [genPool, setGenPool] = useState([]);
-  const [settings, setSettings] = useState({
-    naiToken:"", naiModel:"nai-diffusion-4-5-full", naiSize:"竖图",
-    negative:"lowres, worst quality, bad anatomy, text, watermark, signature",
-    artistPresets:[], activePreset:null,
-    llmMode:"anthropic", llmBaseUrl:"", llmApiKey:"", llmModel:"claude-sonnet-4-6",
-    aestheticDesc:"", charCard:"", memory:"",
-  });
+  const [settings, setSettings] = useState(loadSettings);
 
   // ── 搭配页state提升，tab切换不丢失 ──
   const [chatMessages, setChatMessages] = useState([]); // 对话历史跨tab保留
@@ -1408,7 +1422,11 @@ export default function App() {
   };
 
   const handleUpdateMemory = (newMemory) => {
-    setSettings(prev=>({...prev, memory:newMemory}));
+    setSettings(prev=>{
+      const next = {...prev, memory:newMemory};
+      saveSettings(next);
+      return next;
+    });
   };
 
   const handleRegenerate = (item) => {
