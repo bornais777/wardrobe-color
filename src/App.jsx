@@ -1,4 +1,6 @@
-import { useState, useCallback, useRef, useEffect } from "react";
+import { useState, useCallback, useRef, useEffect, useMemo } from "react";
+import { PALETTE_SERIES } from "./palette.js";
+import { GENDERS, SEASONS, SEASON_EN, FACE_SHAPES, buildAnalysisPrompt } from "./prompts.js";
 
 // ═══════════════════════════════════════════════════════
 // 设计 token
@@ -16,101 +18,136 @@ const T = {
 
 // ═══════════════════════════════════════════════════════
 // 统一 LLM 调用（支持 Anthropic 原生 + OpenAI 兼容接口）
+// 可配：温度 / token 上限 / 流式输出（设置页 → 文字 AI）
 // ═══════════════════════════════════════════════════════
-async function callLLM({ settings, system, userContent, maxTokens = 1000, imageBase64 = null, imageMime = "image/jpeg" }) {
+const numOrUndef = (v) => (v === "" || v == null || !Number.isFinite(Number(v)) ? undefined : Number(v));
+
+// 逐行读取 SSE：每个 data: {...} 回调一次
+async function readSSE(resp, onEvent) {
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const lines = buf.split("\n");
+    buf = lines.pop();
+    for (const raw of lines) {
+      const line = raw.trim();
+      if (!line.startsWith("data:")) continue;
+      const payload = line.slice(5).trim();
+      if (!payload || payload === "[DONE]") continue;
+      try { onEvent(JSON.parse(payload)); } catch {}
+    }
+  }
+}
+
+// Gemini 等兼容接口对 system role 支持不稳，把 system 合并进第一条 user 消息更可靠
+function mergeSystemIntoFirstUser(system, messages) {
+  const msgs = messages.map((m) => ({ ...m }));
+  if (!system) return msgs;
+  const i = msgs.findIndex((m) => m.role === "user");
+  if (i < 0) return [{ role: "system", content: system }, ...msgs];
+  const c = msgs[i].content;
+  if (typeof c === "string") {
+    msgs[i].content = `${system}\n\n---\n${c}`;
+  } else {
+    let merged = false;
+    msgs[i].content = c.map((p) => {
+      if (!merged && p.type === "text") { merged = true; return { ...p, text: `${system}\n\n---\n${p.text}` }; }
+      return p;
+    });
+  }
+  return msgs;
+}
+
+async function requestLLM({ settings, system, messages, maxTokens = 1000, onDelta = null }) {
   const mode = settings.llmMode || "anthropic";
   const model = settings.llmModel || "claude-sonnet-4-6";
+  const temperature = numOrUndef(settings.llmTemperature);
+  const cap = numOrUndef(settings.llmMaxTokens);
+  const mt = cap && cap > 0 ? cap : maxTokens;
+  const stream = !!settings.llmStream;
 
   if (mode === "openai") {
-    // OpenAI 兼容格式（Gemini Flash等）
-    // Gemini兼容接口system role支持不稳定，把system内容合并进user消息更可靠
-    const baseUrl = (settings.llmBaseUrl || "https://api.openai.com").replace(/\/$/, "");
+    const baseUrl = (settings.llmBaseUrl || "https://api.openai.com").trim().replace(/\/+$/, "").replace(/\/v1$/, "");
     const apiKey = settings.llmApiKey || "";
-    const msgs = [];
-    // system内容合并到第一条user消息前
-    const fullUserContent = system ? `${system}
-
----
-${userContent}` : userContent;
-    if (imageBase64) {
-      msgs.push({ role: "user", content: [
-        { type: "image_url", image_url: { url: `data:${imageMime};base64,${imageBase64}` } },
-        { type: "text", text: fullUserContent },
-      ]});
-    } else {
-      msgs.push({ role: "user", content: fullUserContent });
-    }
+    const body = {
+      model, max_tokens: mt,
+      messages: mergeSystemIntoFirstUser(system, messages),
+      ...(temperature !== undefined ? { temperature } : {}),
+      ...(stream ? { stream: true } : {}),
+    };
     const resp = await fetch(`${baseUrl}/v1/chat/completions`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiKey}` },
-      body: JSON.stringify({ model, max_tokens: maxTokens, messages: msgs }),
+      body: JSON.stringify(body),
     });
+    if (!resp.ok) {
+      const t = await resp.text().catch(() => "");
+      throw new Error(`文字API HTTP ${resp.status} ${t.slice(0, 120)}`);
+    }
+    if (stream && resp.body) {
+      let acc = "";
+      await readSSE(resp, (ev) => {
+        const d = ev.choices?.[0]?.delta?.content;
+        if (d) { acc += d; onDelta?.(acc); }
+      });
+      return acc;
+    }
     const data = await resp.json();
-    console.log("[callLLM OpenAI] status:", resp.status, "choices:", data.choices?.length, "error:", data.error);
     return data.choices?.[0]?.message?.content || "";
-  } else {
-    // Anthropic 原生格式（支持vision）
-    const userMsg = imageBase64
+  }
+
+  // Anthropic 原生格式（支持 vision）
+  const body = {
+    model, max_tokens: mt,
+    ...(system ? { system } : {}),
+    ...(temperature !== undefined ? { temperature } : {}),
+    ...(stream ? { stream: true } : {}),
+    messages,
+  };
+  const resp = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) {
+    const t = await resp.text().catch(() => "");
+    throw new Error(`文字API HTTP ${resp.status} ${t.slice(0, 120)}`);
+  }
+  if (stream && resp.body) {
+    let acc = "";
+    await readSSE(resp, (ev) => {
+      if (ev.type === "content_block_delta" && ev.delta?.text) { acc += ev.delta.text; onDelta?.(acc); }
+    });
+    return acc;
+  }
+  const data = await resp.json();
+  return data.content?.[0]?.text || "";
+}
+
+async function callLLM({ settings, system, userContent, maxTokens = 1000, imageBase64 = null, imageMime = "image/jpeg", onDelta = null }) {
+  const mode = settings.llmMode || "anthropic";
+  let content = userContent;
+  if (imageBase64) {
+    content = mode === "openai"
       ? [
-          { type: "image", source: { type: "base64", media_type: imageMime, data: imageBase64 } },
+          { type: "image_url", image_url: { url: `data:${imageMime};base64,${imageBase64}` } },
           { type: "text", text: userContent },
         ]
-      : userContent;
-    const resp = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model, max_tokens: maxTokens,
-        ...(system ? { system } : {}),
-        messages: [{ role: "user", content: userMsg }],
-      }),
-    });
-    const data = await resp.json();
-    return data.content?.[0]?.text || "";
+      : [
+          { type: "image", source: { type: "base64", media_type: imageMime, data: imageBase64 } },
+          { type: "text", text: userContent },
+        ];
   }
+  return requestLLM({ settings, system, messages: [{ role: "user", content }], maxTokens, onDelta });
 }
 
 // 多轮对话版（对话弹窗用，需要传完整历史）
 async function callLLMChat({ settings, system, messages, maxTokens = 1000 }) {
-  const mode = settings.llmMode || "anthropic";
-  const model = settings.llmModel || "claude-sonnet-4-6";
-
-  if (mode === "openai") {
-    const baseUrl = (settings.llmBaseUrl || "https://api.openai.com").replace(/\/$/, "");
-    const apiKey = settings.llmApiKey || "";
-    const msgs = [...messages];
-    // system合并进第一条user消息
-    if (system && msgs.length > 0 && msgs[0].role === "user") {
-      msgs[0] = { ...msgs[0], content: `${system}
-
----
-${msgs[0].content}` };
-    } else if (system) {
-      msgs.unshift({ role: "system", content: system });
-    }
-    const resp = await fetch(`${baseUrl}/v1/chat/completions`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({ model, max_tokens: maxTokens, messages: msgs }),
-    });
-    const data = await resp.json();
-    return data.choices?.[0]?.message?.content || "";
-  } else {
-    const resp = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model, max_tokens: maxTokens,
-        ...(system ? { system } : {}),
-        messages,
-      }),
-    });
-    const data = await resp.json();
-    return data.content?.[0]?.text || "";
-  }
+  return requestLLM({ settings, system, messages, maxTokens });
 }
 
 // ═══════════════════════════════════════════════════════
@@ -508,33 +545,146 @@ ${newPrefs}`}]);
 }
 
 // ═══════════════════════════════════════════════════════
-// 搭配页
+// 搭配页（首页：所有选项并列、选填，结果就地生成，不再跳页）
 // ═══════════════════════════════════════════════════════
-function GeneratePage({ settings, onSaveToWardrobe, onUpdateMemory, onAddMaterial, chatMessages, setChatMessages,
-  step, setStep, uploadedImg, setUploadedImg,
-  extractedColors, setExtractedColors,
-  selectedColor, setSelectedColor,
-  selectedSkin, setSelectedSkin,
-  schemes, setSchemes,
-  selectedScheme, setSelectedScheme,
-  generating, setGenerating,
-  genProgress, setGenProgress,
-  resultImg, setResultImg,
-}) {
+const inputStyle = {
+  width:"100%", padding:"9px 11px", borderRadius:T.radiusSm,
+  border:`1px solid ${T.border}`, backgroundColor:T.bg,
+  fontSize:"11px", color:T.text, outline:"none", boxSizing:"border-box",
+};
+const DEFAULT_SKIN = SKIN_TONES[1];
+const BACKEND_KEY = "wardrobe_backend_v1";
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+function makeColor(hex) {
+  const h = hex.toLowerCase();
+  const { r, g, b } = hexToRgb(h);
+  return { hex: h, hsl: rgbToHsl(r, g, b), r, g, b, cnt: 100 };
+}
+function hslToColorName(h, s, l) {
+  if (s < 12) return l > 70 ? "light gray" : l > 40 ? "gray" : "dark gray";
+  if (l > 85) return "off-white";
+  if (l < 20) return "near-black";
+  const names = [[15,"red"],[40,"orange"],[65,"yellow"],[80,"yellow-green"],
+    [150,"green"],[175,"teal"],[200,"sky blue"],[240,"blue"],[270,"purple"],
+    [300,"violet"],[330,"pink"],[360,"red"]];
+  const hue = names.find(([deg]) => h <= deg)?.[1] || "neutral";
+  const lt = l > 70 ? "light " : l < 35 ? "dark " : "";
+  const sat = s < 30 ? "muted " : s > 70 ? "vivid " : "";
+  return `${lt}${sat}${hue}`.trim();
+}
+function colorNameOf(hex) {
+  const { r, g, b } = hexToRgb(hex);
+  const { h, s, l } = rgbToHsl(r, g, b);
+  return hslToColorName(h, s, l);
+}
+
+function Chip({ active, onClick, children }) {
+  return (
+    <button onClick={onClick} style={{
+      padding:"6px 12px", borderRadius:"16px", cursor:"pointer", fontSize:"11px",
+      border:`1px solid ${active ? T.accent : T.border}`,
+      backgroundColor:active ? T.accent : T.surface,
+      color:active ? "#fff" : T.textSub, transition:"all 0.15s",
+    }}>{children}</button>
+  );
+}
+function ToggleChip({ on, onClick, children }) {
+  return (
+    <button onClick={onClick} style={{
+      display:"flex", alignItems:"center", gap:"6px", padding:"6px 11px",
+      borderRadius:"16px", cursor:"pointer", fontSize:"11px",
+      border:`1px solid ${on ? T.accent : T.border}`,
+      backgroundColor:on ? "#fff" : T.surface,
+      color:on ? T.text : T.textMuted, transition:"all 0.15s",
+    }}>
+      <span style={{ width:"10px", height:"10px", borderRadius:"50%", flexShrink:0,
+        border:`1.5px solid ${on ? T.accent : T.textMuted}`,
+        backgroundColor:on ? T.accent : "transparent" }}/>
+      {children}
+    </button>
+  );
+}
+
+function GeneratePage({ settings, onSaveToWardrobe, onUpdateMemory, onAddMaterial, chatMessages, setChatMessages, homeSignal }) {
+  // ── 输入（全部并列、选填）──
+  const [uploadedImg, setUploadedImg] = useState(null);       // {url,name} | {url:null,mockName}
+  const [extractedColors, setExtractedColors] = useState([]);
+  const [selectedColor, setSelectedColor] = useState(null);
+  const [paletteIdx, setPaletteIdx] = useState(0);
+  const [hexInput, setHexInput] = useState("");
+  const [selectedSkin, setSelectedSkin] = useState(null);
+  const [garments, setGarments] = useState([{ id:1, name:"", color:"" }]);
+  const [season, setSeason] = useState(null);
+  const [gender, setGender] = useState("f");
+  const [height, setHeight] = useState("");
+  const [weight, setWeight] = useState("");
+  const [faceId, setFaceId] = useState(null);
+  const [nlDesc, setNlDesc] = useState("");
+  const [schemeId, setSchemeId] = useState("A");
+  const [toggles, setToggles] = useState({});                 // 手动勾选覆盖：undefined=自动
+  const [backend, setBackend] = useState(() => {
+    try { return localStorage.getItem(BACKEND_KEY) === "gpt" ? "gpt" : "nai"; } catch { return "nai"; }
+  });
+
+  // ── 输出 / 过程 ──
+  const [analysis, setAnalysis] = useState("");
+  const [showAnalysis, setShowAnalysis] = useState(true);
+  const [generating, setGenerating] = useState(false);
+  const [genProgress, setGenProgress] = useState("");
+  const [resultImg, setResultImg] = useState(null);
   const [chatOpen, setChatOpen] = useState(false);
-  const [saveFeedback, setSaveFeedback] = useState(false);
   const [showPromptEdit, setShowPromptEdit] = useState(false);
   const [editingPrompt, setEditingPrompt] = useState("");
   const fileRef = useRef(null);
   const resultRef = useRef(null);
+  const scrollRef = useRef(null);
+
+  useEffect(() => { try { localStorage.setItem(BACKEND_KEY, backend); } catch {} }, [backend]);
+
+  // 点击顶部图标回到首页顶部
+  useEffect(() => {
+    if (homeSignal) scrollRef.current?.scrollTo({ top:0, behavior:"smooth" });
+  }, [homeSignal]);
 
   // 生图成功后自动滚到结果区
   useEffect(() => {
-    if (resultImg && resultRef.current) {
-      resultRef.current.scrollIntoView({ behavior: "smooth", block: "start" });
-    }
+    if (resultImg && resultRef.current) resultRef.current.scrollIntoView({ behavior:"smooth", block:"start" });
   }, [resultImg]);
 
+  // ── 派生：配色方案随主色/肤色实时计算，不再需要"分析"这一步 ──
+  const schemes = useMemo(
+    () => (selectedColor ? matchSchemes(selectedColor.hsl, selectedSkin || DEFAULT_SKIN) : []),
+    [selectedColor, selectedSkin]
+  );
+  const selectedScheme = schemes.find(s => s.id === schemeId) || schemes[0] || null;
+
+  // ── 勾选逻辑 ──
+  // 已手动填写 → 默认勾选；未填写 → 需手动勾选（有图片时按图片判断）；发型默认不勾选
+  const filled = {
+    garment: garments.some(g => g.name.trim()),
+    season: !!season,
+    body: Number(height) > 0 || Number(weight) > 0,
+    face: !!faceId,
+    hair: false,
+  };
+  const isOn = (k) => toggles[k] ?? filled[k];
+  const flip = (k) => setToggles(t => ({ ...t, [k]: !isOn(k) }));
+  const clearToggle = (k) => setToggles(t => { if (!(k in t)) return t; const n = { ...t }; delete n[k]; return n; });
+
+  const hasRealImage = !!uploadedImg?.url;
+  const FIELD_KEYS = [
+    { key:"garment", label:"款式" }, { key:"season", label:"季节" },
+    { key:"body", label:"身高体重" }, { key:"face", label:"脸型" }, { key:"hair", label:"发型" },
+  ];
+  const toggleNotes = FIELD_KEYS.filter(f => isOn(f.key) && !filled[f.key]).map(f =>
+    f.key === "hair" ? "发型：按脸型 / 身高 / 体型推导（不看原图发型）"
+      : hasRealImage ? `${f.label}：未填写，按图片判断`
+      : `${f.label}：未填写且无图片，将忽略`);
+
+  const canGenerate = !!selectedColor || filled.garment || filled.season || filled.body || filled.face || !!nlDesc.trim();
+
+  // ── 输入处理 ──
   const handleUpload = (e) => {
     const file = e.target.files?.[0]; if (!file) return;
     const url = URL.createObjectURL(file);
@@ -545,9 +695,7 @@ function GeneratePage({ settings, onSaveToWardrobe, onUpdateMemory, onAddMateria
       setUploadedImg({ url, el:img, name:file.name });
       setExtractedColors(colors);
       setSelectedColor(colors[0] || null);
-      setSchemes([]); setSelectedScheme(null); setResultImg(null);
-      setStep("colors");
-      // 自动同步到材料区
+      setResultImg(null);
       if (onAddMaterial) onAddMaterial({ id:Date.now(), dataUrl:url, name:file.name,
         savedAt:new Date().toLocaleString("zh-CN") });
     };
@@ -559,254 +707,263 @@ function GeneratePage({ settings, onSaveToWardrobe, onUpdateMemory, onAddMateria
   const handleLoadTestOutfit = (outfit) => {
     const colors = outfit.colors.map(c => {
       const l = typeof c.hsl.l === "string" ? parseInt(c.hsl.l) : c.hsl.l;
-      const hsl = { h: c.hsl.h, s: c.hsl.s, l };
-      return { hex: toHex(hsl.h, hsl.s, hsl.l), hsl, ...hexToRgb(toHex(hsl.h, hsl.s, hsl.l)), cnt: 100 };
+      const hex = toHex(c.hsl.h, c.hsl.s, l);
+      return { hex, hsl:{ h:c.hsl.h, s:c.hsl.s, l }, ...hexToRgb(hex), cnt:100 };
     });
-    setUploadedImg({ url: null, mockName: outfit.name });
+    setUploadedImg({ url:null, mockName:outfit.name });
     setExtractedColors(colors);
     setSelectedColor(colors[0]);
-    setSchemes([]); setSelectedScheme(null); setResultImg(null);
-    setStep("colors");
+    setResultImg(null);
   };
 
-  const handleAnalyze = () => {
-    if (!selectedColor || !selectedSkin) return;
-    const mainColor = selectedColor.hsl;
-    const computed = matchSchemes(mainColor, selectedSkin);
-    setSchemes(computed); setSelectedScheme(computed[0]);
-    setStep("scheme");
+  const updateGarment = (id, patch) => setGarments(gs => gs.map(g => g.id === id ? { ...g, ...patch } : g));
+  const addGarment = () => setGarments(gs => [...gs, { id:Date.now(), name:"", color:"" }]);
+  const removeGarment = (id) => setGarments(gs => gs.length > 1 ? gs.filter(g => g.id !== id) : [{ id, name:"", color:"" }]);
+
+  const pickHex = (v) => {
+    setHexInput(v);
+    const m = /^#?([0-9a-fA-F]{6})$/.exec(v.trim());
+    if (m) setSelectedColor(makeColor("#" + m[1]));
   };
 
-  // 文字AI生成NAI prompt（含读图 + 结构化配色）
-  const buildPromptViaAI = async (scheme, mainColor) => {
-    const artistPre = settings.artistPresets?.find(p=>p.id===settings.activePreset);
-    const artistTags = artistPre ? artistPre.tags : "";
-    const negTags = settings.negative || "";
+  const reset = () => {
+    setUploadedImg(null); setExtractedColors([]); setSelectedColor(null);
+    setSelectedSkin(null); setGarments([{ id:1, name:"", color:"" }]);
+    setSeason(null); setGender("f"); setHeight(""); setWeight(""); setFaceId(null);
+    setNlDesc(""); setToggles({}); setAnalysis(""); setResultImg(null); setHexInput("");
+  };
 
-    // 结构化色块文本
-    const skinRef = selectedSkin || { hex:"#F0E0C8", label:"自然白", isWarm:false };
-    const colorStructure = schemeToStructuredText(scheme, skinRef);
+  // ── 生成：搭配分析 → 组装 prompt ──
+  const imageToBase64 = async () => {
+    if (!uploadedImg?.url) return { b64:null, mime:"image/jpeg" };
+    try {
+      const blob = await (await fetch(uploadedImg.url)).blob();
+      const b64 = await new Promise(res => {
+        const fr = new FileReader();
+        fr.onload = () => res(fr.result.split(",")[1]);
+        fr.readAsDataURL(blob);
+      });
+      return { b64, mime: blob.type || "image/jpeg" };
+    } catch { return { b64:null, mime:"image/jpeg" }; }
+  };
 
-    // 读图：把上传的衣服图转base64
-    let imageBase64 = null;
-    let imageMime = "image/jpeg";
-    if (uploadedImg?.url && !uploadedImg.mockName) {
+  // kind: "tag" → NAI tag 串；"nl" → 给 GPT 的英文自然语言描述
+  const buildPrompt = async (kind) => {
+    const artistPre = settings.artistPresets?.find(p => p.id === settings.activePreset);
+    const artistTags = kind === "tag" && artistPre ? artistPre.tags : "";
+    const negTags = kind === "tag" ? (settings.negative || "") : "";
+    const { b64, mime } = await imageToBase64();
+
+    const garmentItems = garments.filter(g => g.name.trim())
+      .map(g => ({ name:g.name.trim(), colorName:g.color ? colorNameOf(g.color) : "" }));
+    const seasonOn = isOn("season") && season;
+
+    // ① 搭配分析（只有至少一个模块生效才调用）
+    let analysisText = "";
+    setAnalysis("");
+    const ap = buildAnalysisPrompt({
+      gender, height, weight, faceId, season, garments:garmentItems,
+      enabled:{ garment:isOn("garment"), season:isOn("season"), body:isOn("body"), face:isOn("face"), hair:isOn("hair") },
+      hasImage:!!b64, nl:nlDesc.trim(),
+    });
+    if (ap) {
+      setGenProgress("分析搭配…");
       try {
-        const imgResp = await fetch(uploadedImg.url);
-        const blob = await imgResp.blob();
-        imageMime = blob.type || "image/jpeg";
-        imageBase64 = await new Promise(res => {
-          const fr = new FileReader();
-          fr.onload = () => res(fr.result.split(",")[1]);
-          fr.readAsDataURL(blob);
-        });
-      } catch { imageBase64 = null; }
+        analysisText = (await callLLM({
+          settings, system:ap.system, userContent:ap.user, maxTokens:1500,
+          imageBase64:b64, imageMime:mime, onDelta:t => setAnalysis(t),
+        })).trim();
+        setAnalysis(analysisText);
+      } catch (e) {
+        console.warn("[分析失败]", e);
+        setGenProgress("分析失败，改用基础配色组装…");
+        await sleep(900);
+      }
     }
 
-    // 把色块直接转成颜色描述词，硬编码保证一定出现
-    const hslToColorName = (h, s, l) => {
-      if (s < 12) return l > 70 ? "light gray" : l > 40 ? "gray" : "dark gray";
-      if (l > 85) return "off-white"; if (l < 20) return "near-black";
-      const names = [[15,"red"],[40,"orange"],[65,"yellow"],[80,"yellow-green"],
-        [150,"green"],[175,"teal"],[200,"sky blue"],[240,"blue"],[270,"purple"],
-        [300,"violet"],[330,"pink"],[360,"red"]];
-      const hue = names.find(([deg]) => h <= deg)?.[1] || "neutral";
-      const lt = l > 70 ? "light " : l < 35 ? "dark " : "";
-      const sat = s < 30 ? "muted " : s > 70 ? "vivid " : "";
-      return `${lt}${sat}${hue}`.trim();
-    };
-    const hexToHSL2 = (hex) => {
-      let r=parseInt(hex.slice(1,3),16)/255, g=parseInt(hex.slice(3,5),16)/255, b=parseInt(hex.slice(5,7),16)/255;
-      const max=Math.max(r,g,b), min=Math.min(r,g,b), l=(max+min)/2;
-      if(max===min) return {h:0,s:0,l:Math.round(l*100)};
-      const d=max-min, s=l>0.5?d/(2-max-min):d/(max+min);
-      let h=0;
-      if(max===r) h=((g-b)/d+(g<b?6:0))/6;
-      else if(max===g) h=((b-r)/d+2)/6;
-      else h=((r-g)/d+4)/6;
-      return {h:Math.round(h*360),s:Math.round(s*100),l:Math.round(l*100)};
-    };
-    // 从色块提取颜色描述
-    const toName = (hex) => { const {h,s,l}=hexToHSL2(hex); return hslToColorName(h,s,l); };
-    // 按顺序分配：跳过肤色和参考色，按实际色块顺序分配单品
-    const usableColors = selectedScheme.colors.filter(c=>c.size!=="lg"&&!c.isRef);
-    const garmentSlots = ["top","pants","sneakers","bag","accessory"];
-    const mandatoryColorTags = usableColors.slice(0,5).map((c,i) =>
-      `${toName(c.hex)} ${garmentSlots[i]||"accessory"}`
-    ).join(", ");
-    console.log("[mandatoryColorTags]", mandatoryColorTags);
+    // ② 强制色块：有自填单品时由单品主导，否则按配色方案分配
+    const scheme = selectedColor ? selectedScheme : null;
+    const usable = scheme ? scheme.colors.filter(c => c.size !== "lg" && !c.isRef) : [];
+    const palette = usable.map(c => colorNameOf(c.hex));
+    const slots = ["top","pants","sneakers","bag","accessory"];
+    const mandatoryArr = garmentItems.length ? []
+      : usable.slice(0,5).map((c,i) => `${colorNameOf(c.hex)} ${slots[i] || "accessory"}`);
 
-    // 强制色块拆成数组，每个单品独立保留
-    const mandatoryArr = mandatoryColorTags.split(",").map(s=>s.trim()).filter(Boolean);
-    const garmentCount = mandatoryArr.length;
+    const info = [
+      mandatoryArr.length ? `Mandatory garments (${mandatoryArr.length} items — describe ALL of them, in order): ${mandatoryArr.join(", ")}` : "",
+      garmentItems.length ? `User-specified garments (all must appear; translate names to English; keep the given colors): ${garmentItems.map(g => `${g.name}${g.colorName ? ` [color: ${g.colorName}]` : ""}`).join("; ")}` : "",
+      palette.length ? `Overall color palette (main → accent): ${palette.join(", ")}` : "",
+      `Gender: ${gender === "m" ? "male" : "female"}`,
+      seasonOn ? `Season: ${SEASON_EN[season]}` : "",
+      analysisText ? `Stylist analysis (turn its conclusions into visible details):\n${analysisText}` : "",
+      nlDesc.trim() ? `User description (follow it): ${nlDesc.trim()}` : "",
+      b64 ? "A reference image shows the main garment style — keep its silhouette, then expand the rest of the outfit." : "",
+      `User style preference: ${settings.aestheticDesc || "casual everyday"}`,
+    ].filter(Boolean).join("\n");
+
+    setGenProgress("组装 prompt…");
+
+    if (kind === "nl") {
+      const sys = `You write prompts for a text-to-image model. Output ONLY one English paragraph (under 120 words) describing a full-body fashion photo of a single standing ${gender === "m" ? "man" : "woman"} on a plain light background, wearing the outfit.
+Keep every given color wording exactly. Turn the analysis conclusions (hem length, waist position, neckline shape, fabric weight, hair shape if given) into concrete visible details. Do not contradict the user-specified garments. No markdown, no explanation, no fantasy or ancient costume.`;
+      let text = "";
+      try {
+        text = (await callLLM({ settings, system:sys, userContent:`${info}\nWrite the image prompt now:`,
+          maxTokens:500, imageBase64:b64, imageMime:mime })).trim();
+      } catch (e) { console.warn("[NL prompt失败]", e); }
+      if (!text) {
+        text = `Full-body fashion photo of a ${gender === "m" ? "man" : "woman"} standing against a plain light background, wearing ${[...mandatoryArr, ...garmentItems.map(g => `${g.colorName} ${g.name}`.trim())].join(", ") || "an everyday outfit"}.`;
+      }
+      return { tag:text, negative:"" };
+    }
 
     const sys = `You are a NovelAI fashion prompt writer.
-You will receive a list of MANDATORY "color + garment" tags (e.g. "dark muted green top, muted violet pants, light gray sneakers").
-The list has ${garmentCount} garments. You MUST write style tags for EVERY one of them — never stop after the first garment.
-For EACH garment add 2-4 extra tags: specific style (hoodie/coat/skirt/jeans/sneakers/bag etc), silhouette (oversized/fitted/high-waisted), material (cotton/denim/knit/leather), and one styling detail.
-Keep the given colors EXACTLY as written. Output ONLY a comma-separated English tag string. No sentences, no markdown, no explanation.
-NO fantasy, NO gown, NO ancient costume.`;
+Input: a stylist analysis (may be absent), MANDATORY "color + garment" tags, user-specified garments, season, and a free-text description.
+Output ONLY one comma-separated English tag string describing the outfit to draw.
+Rules:
+- Keep every MANDATORY tag exactly as written, and add 2-4 extra tags for each garment: garment type, silhouette, material, one styling detail. Derive them from the analysis and the user's inputs — do not fall back on generic defaults.
+- Every user-specified garment must appear (translate names to English tags, keep their given colors).
+- Conclusions about hem length, waist position, neckline shape, fabric weight and season must be visible in the tags.
+- If the analysis gives hair parameters (top volume, side volume, end point, line direction), convert them into concrete hair tags (length, volume, shape). Otherwise do not mention hair.
+- No sentences, no markdown, no explanation. No fantasy, no gown, no ancient costume.`;
 
-    const userMsg = `Mandatory garments (${garmentCount} items — you must describe ALL of them, in order): ${mandatoryColorTags}
-${imageBase64 ? "A reference image shows the main garment style — keep its silhouette, then expand the rest of the outfit." : ""}
-User style preference: ${settings.aestheticDesc||"casual everyday"}
-Write the comma-separated style tags now (cover every garment):`;
+    let rawAiTags = "";
+    try {
+      rawAiTags = (await callLLM({ settings, system:sys, userContent:`${info}\nWrite the comma-separated tags now:`,
+        maxTokens:800, imageBase64:b64, imageMime:mime })).trim();
+    } catch (e) { console.warn("[tag生成失败]", e); }
+    setGenProgress(rawAiTags ? `AI: ${rawAiTags.slice(0,80)}…` : "⚠️ AI返回为空（已用基础词兜底）");
+    await sleep(900);
 
-    const rawAiTags = (await callLLM({
-      settings,
-      system: sys,
-      userContent: userMsg,
-      maxTokens: 800,
-      imageBase64,
-      imageMime,
-    })).trim();
-    console.log("[buildPromptViaAI] AI完整返回:", rawAiTags);
-    setGenProgress(rawAiTags ? `AI: ${rawAiTags.slice(0,80)}…` : "⚠️ AI返回为空（已用硬编码颜色兜底）");
-    await new Promise(r=>setTimeout(r,1200));
+    // 确定性拼装：强制色块在最前，AI 只补充风格词；即使 AI 返回空也有可用 prompt
+    const aiArr = rawAiTags.split(",").map(s => s.trim()).filter(Boolean);
+    const baseTags = [gender === "m" ? "1boy" : "1girl", "full body", "standing", "white background",
+      "fashion photography", "real clothing", "everyday wear", "street fashion"];
+    const seen = new Set(); const merged = [];
+    const pushTag = (t) => { const k = t.toLowerCase(); if (!t || seen.has(k)) return; seen.add(k); merged.push(t); };
+    mandatoryArr.forEach(pushTag);
+    aiArr.forEach(pushTag);
+    baseTags.forEach(pushTag);
+    const tag = [merged.join(", "), artistTags].filter(Boolean).join(", ");
+    return { tag, negative:negTags };
+  };
 
-    // ── 确定性拼装：强制色块永远在最前，AI只负责补充风格词 ──
-    // 这样即使 AI 漏掉颜色、只展开第一个单品、或整体返回空，
-    // 每个色块的「颜色+单品」都一定出现在最终 prompt 里。
-    const aiArr   = rawAiTags.split(",").map(s=>s.trim()).filter(Boolean);
-    const baseTags = ["1girl","full body","standing","white background",
-      "fashion photography","real clothing","everyday wear","street fashion"];
+  // ── 生成：调用生图接口 ──
+  const urlToDataUrl = async (url) => {
+    const blob = await (await fetch(url)).blob();
+    return new Promise(res => { const fr = new FileReader(); fr.onload = () => res(fr.result); fr.readAsDataURL(blob); });
+  };
 
-    const seen = new Set();
-    const merged = [];
-    const pushTag = (t) => {
-      const key = t.toLowerCase();
-      if (!t || seen.has(key)) return;
-      seen.add(key); merged.push(t);
+  const runNai = async (tag, negative) => {
+    const proxyUrl = (settings.naiProxyUrl || "").trim();
+    if (!proxyUrl) throw new Error("请先在设置里填写 NAI 接口地址");
+    const reqBody = {
+      token: settings.naiToken,
+      model: settings.naiModel || "nai-diffusion-4-5-full",
+      sampler: settings.naiSampler || "k_dpmpp_2m",
+      noise_schedule: settings.naiNoiseSchedule || "karras",
+      cfg: settings.naiCfg || "0",
+      scale: settings.naiScale || "5",
+      steps: settings.naiSteps || "28",
+      seed: -1, size: settings.naiSize || "竖图", stream: 1, nocache: 1,
+      tag, negative,
+      addition: { imageToImageBase64:null, vibeTransferList:[], multiRoleList:[], characterKeep:null },
     };
-    mandatoryArr.forEach(pushTag); // ① 强制颜色单品（最高优先级）
-    aiArr.forEach(pushTag);        // ② AI 补充的风格/材质/廓形词
-    baseTags.forEach(pushTag);     // ③ 必备构图基础词
+    // 返回的图片地址若是相对路径，需要补上接口站点前缀
+    const base = proxyUrl.replace(/\/api\/generate.*$/, "").replace(/\/api$/, "");
+    const resp = await fetch(proxyUrl, {
+      method:"POST",
+      headers:{ "Authorization":`Bearer ${settings.naiToken}`, "Content-Type":"application/json" },
+      body:JSON.stringify(reqBody),
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = ""; let imageUrl = null;
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream:true });
+      const lines = buf.split("\n");
+      buf = lines.pop();
+      for (const line of lines) {
+        const l = line.trim(); if (!l) continue;
+        try {
+          const obj = JSON.parse(l);
+          if (obj.status === "wait") setGenProgress(obj.data || "排队中…");
+          if (obj.status === "success" && obj.url) imageUrl = obj.url.startsWith("http") ? obj.url : base + obj.url;
+        } catch {}
+      }
+    }
+    if (!imageUrl) throw new Error("未收到图片URL");
+    setGenProgress("下载图片…");
+    return urlToDataUrl(imageUrl);
+  };
 
-    const aiTags = merged.join(", ");
-    console.log("[buildPromptViaAI] 最终拼装tag:", aiTags);
-
-    // 画师串放最后
-    const finalTag = [aiTags, artistTags].filter(Boolean).join(", ");
-    return { tag: finalTag, negative: negTags };
+  const runGpt = async (prompt) => {
+    const base = (settings.gptBaseUrl || "").trim().replace(/\/+$/, "").replace(/\/v1$/, "");
+    if (!base) throw new Error("请先在设置里填写 GPT 接口地址");
+    const resp = await fetch(`${base}/v1/images/generations`, {
+      method:"POST",
+      headers:{ "Authorization":`Bearer ${settings.gptApiKey}`, "Content-Type":"application/json" },
+      body:JSON.stringify({ model:settings.gptModel || "gpt-image-1", prompt, size:settings.gptSize || "1024x1536", n:1 }),
+    });
+    if (!resp.ok) {
+      const t = await resp.text().catch(() => "");
+      throw new Error(`HTTP ${resp.status} ${t.slice(0,120)}`);
+    }
+    const data = await resp.json();
+    const first = data.data?.[0];
+    if (first?.b64_json) return `data:image/png;base64,${first.b64_json}`;
+    if (first?.url) { setGenProgress("下载图片…"); return urlToDataUrl(first.url); }
+    throw new Error("未收到图片");
   };
 
   const handleGenerate = async (overrideTag = null) => {
-    if (!selectedScheme) return;
-    setGenerating(true); setGenProgress(overrideTag?"使用自定义prompt…":"文字AI组装prompt…"); setResultImg(null);
-    setShowPromptEdit(false);
+    if (generating || (!overrideTag && !canGenerate)) return;
+    setGenerating(true); setResultImg(null); setShowPromptEdit(false);
+    setGenProgress(overrideTag ? "使用自定义prompt…" : "准备中…");
+    const schemeName = selectedScheme?.name || "自定义";
+    const colorHex = selectedColor?.hex || "#b8a99a";
+    const noKey = backend === "gpt" ? !settings.gptApiKey : !settings.naiToken;
 
-    // mock模式：无token时用占位渐变色块验证流程
-    if (!settings.naiToken) {
-      await new Promise(r => setTimeout(r, 800));
+    // mock模式：无 Token/Key 时用占位渐变色块验证流程
+    if (noKey) {
+      await sleep(800);
       setGenProgress("（测试模式）生成占位图…");
-      await new Promise(r => setTimeout(r, 600));
-      const c = selectedColor.hex;
+      await sleep(600);
       const mockDataUrl = await new Promise(res => {
         const canvas = document.createElement("canvas");
         canvas.width = 416; canvas.height = 608;
         const ctx = canvas.getContext("2d");
         const grad = ctx.createLinearGradient(0, 0, 416, 608);
-        grad.addColorStop(0, c + "cc");
-        grad.addColorStop(1, c + "44");
+        grad.addColorStop(0, colorHex + "cc"); grad.addColorStop(1, colorHex + "44");
         ctx.fillStyle = grad; ctx.fillRect(0, 0, 416, 608);
-        ctx.fillStyle = "rgba(255,255,255,0.15)";
-        ctx.fillRect(80, 120, 256, 360);
+        ctx.fillStyle = "rgba(255,255,255,0.15)"; ctx.fillRect(80, 120, 256, 360);
         ctx.fillStyle = "rgba(0,0,0,0.25)";
         ctx.font = "14px sans-serif"; ctx.textAlign = "center";
-        ctx.fillText("NAI 测试占位图", 208, 300);
-        ctx.fillText(selectedScheme.name, 208, 320);
+        ctx.fillText(backend === "gpt" ? "GPT 测试占位图" : "NAI 测试占位图", 208, 300);
+        ctx.fillText(schemeName, 208, 320);
         res(canvas.toDataURL("image/png"));
       });
-      const mockTag = `[mock] ${selectedScheme.name}, ${selectedColor.hex}`;
-      const mockItem = { dataUrl: mockDataUrl, prompt: mockTag, negative: "",
-        schemeId: selectedScheme.id, schemeName: selectedScheme.name,
-        color: selectedColor.hex, id: Date.now() };
-      setResultImg(mockItem);
-      onSaveToWardrobe(mockItem); // 自动存入
-      setChatMessages([]);
-      setStep("result");
+      const mockItem = { dataUrl:mockDataUrl, prompt:`[mock] ${schemeName}, ${colorHex}`, negative:"",
+        schemeId:selectedScheme?.id || "", schemeName, color:colorHex, id:Date.now() };
+      setResultImg(mockItem); onSaveToWardrobe(mockItem); setChatMessages([]);
       setGenerating(false);
       return;
     }
 
     try {
-      // 1. 生成prompt（或使用用户编辑的）
       let tag, negative;
-      if (overrideTag) {
-        tag = overrideTag;
-        negative = settings.negative || "";
-      } else {
-        ({ tag, negative } = await buildPromptViaAI(selectedScheme, selectedColor.hsl));
-      }
-      setGenProgress("发送至NAI生成中…");
+      if (overrideTag) { tag = overrideTag; negative = backend === "gpt" ? "" : (settings.negative || ""); }
+      else ({ tag, negative } = await buildPrompt(backend === "gpt" ? "nl" : "tag"));
 
-      // 2. 调NAI中转（SSE流式）
-      const size = settings.naiSize || "竖图";
-      const proxyUrl = (settings.naiProxyUrl || "https://std.loliyc.com/api/generate").trim();
-      const reqBody = {
-        token: settings.naiToken,
-        model: settings.naiModel || "nai-diffusion-4-5-full",
-        sampler: settings.naiSampler || "k_dpmpp_2m",
-        noise_schedule: settings.naiNoiseSchedule || "karras",
-        cfg: settings.naiCfg || "0",
-        scale: settings.naiScale || "5",
-        steps: settings.naiSteps || "28",
-        seed: -1, size, stream: 1, nocache: 1,
-        tag, negative,
-        addition: { imageToImageBase64:null, vibeTransferList:[], multiRoleList:[], characterKeep:null },
-      };
+      setGenProgress(backend === "gpt" ? "发送至GPT生成中…" : "发送至NAI生成中…");
+      const dataUrl = backend === "gpt" ? await runGpt(tag) : await runNai(tag, negative);
 
-      // 中转站URL里如果imageUrl相对路径，需要取base
-      const proxyBase = proxyUrl.replace(/\/api\/generate.*$/, "").replace(/\/api$/, "");
-
-      const resp = await fetch(proxyUrl, {
-        method:"POST",
-        headers:{ "Authorization":`Bearer ${settings.naiToken}`, "Content-Type":"application/json" },
-        body:JSON.stringify(reqBody),
-      });
-
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-
-      // 读取流式NDJSON
-      const reader = resp.body.getReader();
-      const decoder = new TextDecoder();
-      let buf = ""; let imageUrl = null;
-
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream:true });
-        const lines = buf.split("\n");
-        buf = lines.pop();
-        for (const line of lines) {
-          const l = line.trim(); if (!l) continue;
-          try {
-            const obj = JSON.parse(l);
-            if (obj.status === "wait") setGenProgress(obj.data || "排队中…");
-            if (obj.status === "success" && obj.url) {
-              imageUrl = obj.url.startsWith("http") ? obj.url : proxyBase + obj.url;
-            }
-          } catch {}
-        }
-      }
-
-      if (!imageUrl) throw new Error("未收到图片URL");
-      setGenProgress("下载图片…");
-
-      // 下载图片转dataUrl
-      const imgResp = await fetch(imageUrl);
-      const blob = await imgResp.blob();
-      const dataUrl = await new Promise(res => {
-        const fr = new FileReader(); fr.onload = () => res(fr.result); fr.readAsDataURL(blob);
-      });
-
-      const newItem = { dataUrl, prompt:tag, negative, schemeId:selectedScheme.id,
-        schemeName:selectedScheme.name, color:selectedColor.hex, id:Date.now() };
-      setResultImg(newItem);
-      onSaveToWardrobe(newItem); // 自动存入
-      setChatMessages([]);
-      setStep("result");
-
+      const newItem = { dataUrl, prompt:tag, negative, schemeId:selectedScheme?.id || "",
+        schemeName, color:colorHex, id:Date.now() };
+      setResultImg(newItem); onSaveToWardrobe(newItem); setChatMessages([]);
     } catch (err) {
       console.error("生成失败:", err);
       setGenProgress(`生成失败：${err.message || String(err)}`);
@@ -816,26 +973,21 @@ Write the comma-separated style tags now (cover every garment):`;
     setGenerating(false);
   };
 
-  const handleSave = () => {
-    if (!resultImg) return;
-    onSaveToWardrobe(resultImg);
-    setSaveFeedback(true);
-    setTimeout(()=>setSaveFeedback(false), 1800);
-  };
-
-  const reset = () => {
-    setStep("upload"); setUploadedImg(null); setExtractedColors([]);
-    setSelectedColor(null); setSchemes([]); setSelectedScheme(null);
-    setResultImg(null); setSelectedSkin(null);
-  };
+  // ── 渲染 ──
+  const optLabel = (txt) => <SectionLabel>{txt}</SectionLabel>;
+  const series = PALETTE_SERIES[paletteIdx] || PALETTE_SERIES[0];
 
   return (
     <div style={{ display:"flex",flexDirection:"column",height:"100%",overflow:"hidden" }}>
-      <div style={{ flex:1,overflowY:"auto",padding:"16px" }}>
+      <div ref={scrollRef} style={{ flex:1,overflowY:"auto",padding:"16px" }}>
 
-        {/* ── 上传区 ── */}
+        {/* ── 01 上传 ── */}
         <div style={{ marginBottom:"18px" }}>
-          <SectionLabel>01 · 上传衣物图片（自己的或网图）</SectionLabel>
+          <div style={{ display:"flex",alignItems:"center" }}>
+            <div style={{ flex:1 }}>{optLabel("01 · 上传衣物图片（选填，自己的或网图）")}</div>
+            <button onClick={reset} style={{ background:"none",border:"none",fontSize:"10px",
+              color:T.textMuted,cursor:"pointer",padding:"0 0 8px" }}>全部清空</button>
+          </div>
           {!uploadedImg ? (
             <div>
               <button onClick={()=>fileRef.current?.click()} style={{
@@ -847,7 +999,6 @@ Write the comma-separated style tags now (cover every garment):`;
                 <span style={{ fontSize:"28px",opacity:0.3 }}>+</span>
                 <span style={{ fontSize:"11px",color:T.textMuted }}>点击上传衣物图片</span>
               </button>
-              {/* 测试入口 */}
               <div style={{ backgroundColor:T.surface,borderRadius:T.radius,
                 border:`1px solid ${T.border}`,padding:"12px" }}>
                 <p style={{ fontSize:"10px",color:T.textMuted,margin:"0 0 8px",letterSpacing:"0.05em" }}>
@@ -862,8 +1013,7 @@ Write the comma-separated style tags now (cover every garment):`;
                     }}>
                       <div style={{ display:"flex",gap:"2px" }}>
                         {outfit.colors.slice(0,3).map((c,ci)=>(
-                          <div key={ci} style={{ width:"8px",height:"8px",borderRadius:"50%",
-                            backgroundColor:c.hex }}/>
+                          <div key={ci} style={{ width:"8px",height:"8px",borderRadius:"50%",backgroundColor:c.hex }}/>
                         ))}
                       </div>
                       {outfit.name}
@@ -874,7 +1024,6 @@ Write the comma-separated style tags now (cover every garment):`;
             </div>
           ) : (
             <div>
-              {/* 已选：紧凑行展示当前图/色卡，保留上传按钮和重选 */}
               <div style={{ display:"flex",alignItems:"center",gap:"8px",
                 padding:"8px 10px",borderRadius:T.radiusSm,
                 border:`1px solid ${T.border}`,backgroundColor:T.surface,marginBottom:"8px" }}>
@@ -896,14 +1045,11 @@ Write the comma-separated style tags now (cover every garment):`;
                 </span>
                 <button onClick={()=>fileRef.current?.click()} style={{
                   padding:"4px 8px",borderRadius:"6px",border:`1px solid ${T.border}`,
-                  backgroundColor:T.bg,fontSize:"10px",color:T.textSub,cursor:"pointer",flexShrink:0,
-                }}>换图</button>
-                <button onClick={reset} style={{
+                  backgroundColor:T.bg,fontSize:"10px",color:T.textSub,cursor:"pointer",flexShrink:0 }}>换图</button>
+                <button onClick={()=>{ setUploadedImg(null); setExtractedColors([]); }} style={{
                   padding:"4px 8px",borderRadius:"6px",border:"none",
-                  backgroundColor:"transparent",fontSize:"10px",color:T.textMuted,cursor:"pointer",flexShrink:0,
-                }}>重选</button>
+                  backgroundColor:"transparent",fontSize:"10px",color:T.textMuted,cursor:"pointer",flexShrink:0 }}>移除</button>
               </div>
-              {/* 测试色卡快速切换（仍然可见） */}
               <div style={{ display:"flex",flexWrap:"wrap",gap:"5px" }}>
                 {TEST_OUTFITS.map((outfit,i)=>(
                   <button key={i} onClick={()=>handleLoadTestOutfit(outfit)} style={{
@@ -911,12 +1057,10 @@ Write the comma-separated style tags now (cover every garment):`;
                     border:`1px solid ${uploadedImg.mockName===outfit.name?T.accent:T.border}`,
                     backgroundColor:uploadedImg.mockName===outfit.name?T.accentSoft:T.bg,
                     fontSize:"10px",color:T.textSub,cursor:"pointer",
-                    display:"flex",alignItems:"center",gap:"4px",
-                  }}>
+                    display:"flex",alignItems:"center",gap:"4px" }}>
                     <div style={{ display:"flex",gap:"2px" }}>
                       {outfit.colors.slice(0,3).map((c,ci)=>(
-                        <div key={ci} style={{ width:"7px",height:"7px",borderRadius:"50%",
-                          backgroundColor:c.hex }}/>
+                        <div key={ci} style={{ width:"7px",height:"7px",borderRadius:"50%",backgroundColor:c.hex }}/>
                       ))}
                     </div>
                     {outfit.name}
@@ -928,74 +1072,189 @@ Write the comma-separated style tags now (cover every garment):`;
           <input ref={fileRef} type="file" accept="image/*" style={{ display:"none" }} onChange={handleUpload}/>
         </div>
 
-        {/* ── 提取主色 + 肤色 ── */}
-        {step !== "upload" && (
-          <div style={{ marginBottom:"18px" }}>
-            <SectionLabel>02 · 选择衣物主色</SectionLabel>
-            <div style={{ display:"flex",gap:"8px",flexWrap:"wrap",marginBottom:"12px" }}>
-              {extractedColors.map((c,i)=>(
-                <button key={i} onClick={()=>setSelectedColor(c)} style={{
-                  width:"38px",height:"38px",borderRadius:"9px",
-                  backgroundColor:c.hex,border:"none",cursor:"pointer",flexShrink:0,
-                  outline:selectedColor===c?`3px solid ${T.accent}`:"3px solid transparent",
-                  outlineOffset:"2px",transition:"outline 0.15s",
-                  boxShadow:T.shadow,
-                }}/>
-              ))}
-              <button onClick={()=>setStep("upload")} style={{
-                width:"38px",height:"38px",borderRadius:"9px",
-                border:`1px dashed ${T.border}`,backgroundColor:"transparent",
-                color:T.textMuted,fontSize:"18px",cursor:"pointer",
-              }}>+</button>
-            </div>
-            {selectedColor && (
-              <div style={{ display:"flex",alignItems:"center",gap:"10px",
-                backgroundColor:T.surface,borderRadius:T.radiusSm,
-                padding:"8px 12px",border:`1px solid ${T.border}` }}>
-                <div style={{ width:"28px",height:"28px",borderRadius:"6px",
-                  backgroundColor:selectedColor.hex,border:"1px solid rgba(0,0,0,0.1)" }}/>
-                <span style={{ fontSize:"11px",color:T.textSub,fontFamily:"monospace" }}>
-                  {selectedColor.hex.toUpperCase()} · H{selectedColor.hsl.h}° S{selectedColor.hsl.s}% L{selectedColor.hsl.l}%
-                </span>
-              </div>
-            )}
-
-            <div style={{ marginTop:"14px" }}>
-              <SectionLabel>肤色（配色参照）</SectionLabel>
-              <div style={{ display:"flex",gap:"6px",flexWrap:"wrap" }}>
-                {SKIN_TONES.map(skin=>(
-                  <button key={skin.id} onClick={()=>setSelectedSkin(skin)} style={{
-                    display:"flex",flexDirection:"column",alignItems:"center",gap:"4px",
-                    padding:"6px 8px",borderRadius:"9px",border:"none",cursor:"pointer",
-                    backgroundColor:selectedSkin?.id===skin.id?T.surface:"transparent",
-                    outline:selectedSkin?.id===skin.id?`2px solid ${T.accent}`:"2px solid transparent",
-                    outlineOffset:"1px",
-                  }}>
-                    <div style={{ width:"30px",height:"30px",borderRadius:"50%",
-                      backgroundColor:skin.hex,border:"1px solid rgba(0,0,0,0.1)",
-                      boxShadow:T.shadow }}/>
-                    <span style={{ fontSize:"9px",color:T.textSub }}>{skin.label}</span>
-                  </button>
+        {/* ── 02 衣物主色（只选颜色，不再跳页）── */}
+        <div style={{ marginBottom:"18px" }}>
+          {optLabel("02 · 衣物主色（选填）")}
+          {extractedColors.length > 0 && (
+            <div style={{ marginBottom:"10px" }}>
+              <p style={{ fontSize:"9px",color:T.textMuted,margin:"0 0 5px" }}>从图片提取</p>
+              <div style={{ display:"flex",gap:"8px",flexWrap:"wrap" }}>
+                {extractedColors.map((c,i)=>(
+                  <button key={i} onClick={()=>setSelectedColor(c)} style={{
+                    width:"34px",height:"34px",borderRadius:"9px",
+                    backgroundColor:c.hex,border:"none",cursor:"pointer",flexShrink:0,
+                    outline:selectedColor?.hex===c.hex?`3px solid ${T.accent}`:"3px solid transparent",
+                    outlineOffset:"2px",transition:"outline 0.15s",boxShadow:T.shadow }}/>
                 ))}
               </div>
             </div>
-
-            <button onClick={handleAnalyze} disabled={!selectedColor||!selectedSkin}
-              style={{ width:"100%",marginTop:"12px",padding:"10px",borderRadius:T.radiusSm,
-                border:"none",backgroundColor:(!selectedColor||!selectedSkin)?T.border:T.accent,
-                color:(!selectedColor||!selectedSkin)?T.textMuted:"#fff",
-                fontSize:"12px",fontWeight:"500",cursor:(!selectedColor||!selectedSkin)?"not-allowed":"pointer" }}>
-              分析配色方案
-            </button>
+          )}
+          <p style={{ fontSize:"9px",color:T.textMuted,margin:"0 0 5px" }}>色卡库</p>
+          <div style={{ display:"flex",gap:"5px",overflowX:"auto",paddingBottom:"6px",marginBottom:"6px" }}>
+            {PALETTE_SERIES.map((s,i)=>(
+              <button key={s.name} onClick={()=>setPaletteIdx(i)} style={{
+                padding:"4px 10px",borderRadius:"14px",flexShrink:0,cursor:"pointer",fontSize:"10px",
+                border:`1px solid ${paletteIdx===i?T.accent:T.border}`,
+                backgroundColor:paletteIdx===i?T.accent:T.surface,
+                color:paletteIdx===i?"#fff":T.textSub }}>{s.name}</button>
+            ))}
           </div>
-        )}
+          <div style={{ display:"flex",gap:"10px",flexWrap:"wrap",marginBottom:"10px" }}>
+            {series.colors.map(([name,hex])=>(
+              <button key={hex} onClick={()=>{ setSelectedColor(makeColor(hex)); setHexInput(hex); }} style={{
+                display:"flex",flexDirection:"column",alignItems:"center",gap:"3px",
+                background:"none",border:"none",cursor:"pointer",padding:0 }}>
+                <div style={{ width:"34px",height:"34px",borderRadius:"9px",backgroundColor:hex,
+                  outline:selectedColor?.hex===hex.toLowerCase()?`3px solid ${T.accent}`:"3px solid transparent",
+                  outlineOffset:"2px",boxShadow:T.shadow,transition:"outline 0.15s" }}/>
+                <span style={{ fontSize:"9px",color:T.textSub }}>{name}</span>
+              </button>
+            ))}
+          </div>
+          <div style={{ display:"flex",gap:"8px",alignItems:"center" }}>
+            <label style={{ position:"relative",width:"34px",height:"34px",flexShrink:0 }} title="自定义取色">
+              <div style={{ width:"34px",height:"34px",borderRadius:"9px",border:`1.5px dashed ${T.border}`,
+                display:"flex",alignItems:"center",justifyContent:"center",color:T.textMuted,fontSize:"16px" }}>+</div>
+              <input type="color" value={selectedColor?.hex || "#c8b090"}
+                onChange={e=>{ setSelectedColor(makeColor(e.target.value)); setHexInput(e.target.value); }}
+                style={{ position:"absolute",inset:0,opacity:0,width:"100%",height:"100%",cursor:"pointer" }}/>
+            </label>
+            <input value={hexInput} onChange={e=>pickHex(e.target.value)} placeholder="输入 hex，如 #C7654D"
+              style={{ ...inputStyle,flex:1,fontFamily:"monospace" }}/>
+          </div>
+          {selectedColor && (
+            <div style={{ display:"flex",alignItems:"center",gap:"10px",marginTop:"10px",
+              backgroundColor:T.surface,borderRadius:T.radiusSm,padding:"8px 12px",border:`1px solid ${T.border}` }}>
+              <div style={{ width:"28px",height:"28px",borderRadius:"6px",
+                backgroundColor:selectedColor.hex,border:"1px solid rgba(0,0,0,0.1)" }}/>
+              <span style={{ fontSize:"11px",color:T.textSub,fontFamily:"monospace",flex:1 }}>
+                {selectedColor.hex.toUpperCase()} · H{selectedColor.hsl.h}° S{selectedColor.hsl.s}% L{selectedColor.hsl.l}%
+              </span>
+              <button onClick={()=>{ setSelectedColor(null); setHexInput(""); }} style={{ background:"none",
+                border:"none",fontSize:"10px",color:T.textMuted,cursor:"pointer" }}>清除</button>
+            </div>
+          )}
+        </div>
+
+        {/* ── 03 肤色 ── */}
+        <div style={{ marginBottom:"18px" }}>
+          {optLabel("03 · 肤色（选填，配色参照；不选按自然白）")}
+          <div style={{ display:"flex",gap:"6px",flexWrap:"wrap" }}>
+            {SKIN_TONES.map(skin=>(
+              <button key={skin.id} onClick={()=>setSelectedSkin(selectedSkin?.id===skin.id?null:skin)} style={{
+                display:"flex",flexDirection:"column",alignItems:"center",gap:"4px",
+                padding:"6px 8px",borderRadius:"9px",border:"none",cursor:"pointer",
+                backgroundColor:selectedSkin?.id===skin.id?T.surface:"transparent",
+                outline:selectedSkin?.id===skin.id?`2px solid ${T.accent}`:"2px solid transparent",
+                outlineOffset:"1px" }}>
+                <div style={{ width:"30px",height:"30px",borderRadius:"50%",
+                  backgroundColor:skin.hex,border:"1px solid rgba(0,0,0,0.1)",boxShadow:T.shadow }}/>
+                <span style={{ fontSize:"9px",color:T.textSub }}>{skin.label}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* ── 04 款式 ── */}
+        <div style={{ marginBottom:"18px" }}>
+          {optLabel("04 · 款式（选填，自填单品，可选颜色）")}
+          {garments.map(g=>(
+            <div key={g.id} style={{ display:"flex",gap:"6px",alignItems:"center",marginBottom:"6px" }}>
+              <input value={g.name}
+                onChange={e=>{ updateGarment(g.id,{name:e.target.value}); if(e.target.value.trim()) clearToggle("garment"); }}
+                placeholder="如：夹克 / 短裙 / 玛丽珍鞋" style={{ ...inputStyle,flex:1 }}/>
+              <label style={{ position:"relative",width:"32px",height:"32px",flexShrink:0 }} title="选颜色（可不选）">
+                <div style={{ width:"32px",height:"32px",borderRadius:"8px",
+                  border:g.color?"1px solid rgba(0,0,0,0.1)":`1.5px dashed ${T.border}`,
+                  backgroundColor:g.color||"transparent",
+                  display:"flex",alignItems:"center",justifyContent:"center",color:T.textMuted,fontSize:"13px" }}>
+                  {g.color ? "" : "◐"}
+                </div>
+                <input type="color" value={g.color||"#c8b090"} onChange={e=>updateGarment(g.id,{color:e.target.value})}
+                  style={{ position:"absolute",inset:0,opacity:0,width:"100%",height:"100%",cursor:"pointer" }}/>
+              </label>
+              {g.color ? (
+                <button onClick={()=>updateGarment(g.id,{color:""})} style={{ background:"none",border:"none",
+                  fontSize:"10px",color:T.textMuted,cursor:"pointer",flexShrink:0 }}>清色</button>
+              ) : null}
+              <button onClick={()=>removeGarment(g.id)} style={{ background:"none",border:"none",
+                fontSize:"16px",color:T.textMuted,cursor:"pointer",padding:"0 2px",flexShrink:0 }}>×</button>
+            </div>
+          ))}
+          <button onClick={addGarment} style={{ width:"100%",padding:"7px",borderRadius:T.radiusSm,
+            border:`1.5px dashed ${T.border}`,backgroundColor:"transparent",fontSize:"11px",
+            color:T.textMuted,cursor:"pointer" }}>+ 添加单品</button>
+        </div>
+
+        {/* ── 05 季节 ── */}
+        <div style={{ marginBottom:"18px" }}>
+          {optLabel("05 · 季节（选填，穿的是哪个季节的衣服）")}
+          <div style={{ display:"flex",gap:"6px" }}>
+            {SEASONS.map(s=>(
+              <Chip key={s.id} active={season===s.id}
+                onClick={()=>{ const next = season===s.id ? null : s.id; setSeason(next); if(next) clearToggle("season"); }}>
+                {s.label}
+              </Chip>
+            ))}
+          </div>
+        </div>
+
+        {/* ── 06 性别 / 身高体重 ── */}
+        <div style={{ marginBottom:"18px" }}>
+          {optLabel("06 · 性别 / 身高体重（选填，用于比例与量感建议）")}
+          <div style={{ display:"flex",gap:"6px",marginBottom:"8px" }}>
+            {GENDERS.map(g=>(
+              <Chip key={g.id} active={gender===g.id} onClick={()=>setGender(g.id)}>{g.label}</Chip>
+            ))}
+          </div>
+          <div style={{ display:"flex",gap:"10px" }}>
+            <div style={{ flex:1,position:"relative" }}>
+              <input type="number" inputMode="decimal" value={height} placeholder="身高"
+                onChange={e=>{ setHeight(e.target.value); if(Number(e.target.value)>0) clearToggle("body"); }}
+                style={{ ...inputStyle,paddingRight:"34px" }}/>
+              <span style={{ position:"absolute",right:"11px",top:"50%",transform:"translateY(-50%)",
+                fontSize:"10px",color:T.textMuted }}>cm</span>
+            </div>
+            <div style={{ flex:1,position:"relative" }}>
+              <input type="number" inputMode="decimal" value={weight} placeholder="体重"
+                onChange={e=>{ setWeight(e.target.value); if(Number(e.target.value)>0) clearToggle("body"); }}
+                style={{ ...inputStyle,paddingRight:"34px" }}/>
+              <span style={{ position:"absolute",right:"11px",top:"50%",transform:"translateY(-50%)",
+                fontSize:"10px",color:T.textMuted }}>kg</span>
+            </div>
+          </div>
+          <p style={{ fontSize:"9px",color:T.textMuted,margin:"6px 0 0",lineHeight:1.5 }}>
+            身高管比例，体重管量感；两项都填体型判断更准。体重数值不会出现在结果里。
+          </p>
+        </div>
+
+        {/* ── 07 脸型 ── */}
+        <div style={{ marginBottom:"18px" }}>
+          {optLabel("07 · 脸型（选填，不确定就不选）")}
+          <div style={{ display:"flex",gap:"6px",flexWrap:"wrap" }}>
+            {FACE_SHAPES.map(f=>(
+              <Chip key={f.id} active={faceId===f.id}
+                onClick={()=>{ const next = faceId===f.id ? null : f.id; setFaceId(next); if(next) clearToggle("face"); }}>
+                {f.label}
+              </Chip>
+            ))}
+          </div>
+        </div>
+
+        {/* ── 08 自然语言描述 ── */}
+        <div style={{ marginBottom:"18px" }}>
+          {optLabel("08 · 自然语言描述（选填，由文字API转成生图提示词）")}
+          <textarea value={nlDesc} onChange={e=>setNlDesc(e.target.value)} rows={3}
+            placeholder="想要的整体感觉、场合、风格…"
+            style={{ ...inputStyle,resize:"vertical",fontFamily:"inherit",lineHeight:1.5 }}/>
+        </div>
 
         {/* ── 配色方案 ── */}
-        {(step==="scheme"||step==="result") && schemes.length>0 && (
+        {schemes.length > 0 && (
           <div style={{ marginBottom:"18px" }}>
-            <SectionLabel>03 · 选择配色方案</SectionLabel>
-            {schemes.map((s,i)=>(
-              <div key={s.id} onClick={()=>setSelectedScheme(s)}
+            {optLabel("配色方案")}
+            {schemes.map(s=>(
+              <div key={s.id} onClick={()=>setSchemeId(s.id)}
                 style={{ padding:"12px",borderRadius:T.radius,marginBottom:"8px",
                   border:`2px solid ${selectedScheme?.id===s.id?T.accent:T.border}`,
                   backgroundColor:selectedScheme?.id===s.id?"#fff":T.surface,
@@ -1014,29 +1273,78 @@ Write the comma-separated style tags now (cover every garment):`;
                 </div>
               </div>
             ))}
+          </div>
+        )}
 
-            {/* 生图按钮 */}
-            <button onClick={()=>handleGenerate()} disabled={generating||!selectedScheme}
-              style={{ width:"100%",padding:"11px",borderRadius:T.radiusSm,border:"none",
-                backgroundColor:generating?T.border:T.accent,
-                color:generating?T.textMuted:"#fff",
-                fontSize:"12px",fontWeight:"500",cursor:generating?"default":"pointer",
-                marginTop:"4px" }}>
-              {generating ? genProgress||"生成中…"
-                : settings.naiToken ? "生成穿搭" : "生成穿搭（测试模式）"}
+        {/* ── 参与分析：勾选才生效 ── */}
+        <div style={{ marginBottom:"14px",padding:"12px",borderRadius:T.radius,
+          border:`1px solid ${T.border}`,backgroundColor:T.surface }}>
+          <p style={{ fontSize:"10px",color:T.textMuted,margin:"0 0 8px",letterSpacing:"0.05em" }}>
+            参与分析（勾选才生效；已填写的自动勾选）
+          </p>
+          <div style={{ display:"flex",gap:"6px",flexWrap:"wrap" }}>
+            {FIELD_KEYS.map(f=>(
+              <ToggleChip key={f.key} on={isOn(f.key)} onClick={()=>flip(f.key)}>{f.label}</ToggleChip>
+            ))}
+          </div>
+          {toggleNotes.length > 0 && (
+            <div style={{ marginTop:"8px" }}>
+              {toggleNotes.map((n,i)=>(
+                <p key={i} style={{ fontSize:"9px",color:T.textMuted,margin:"2px 0 0",lineHeight:1.5 }}>· {n}</p>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* ── 生图 ── */}
+        <div style={{ marginBottom:"18px" }}>
+          <div style={{ display:"flex",gap:"6px",marginBottom:"8px" }}>
+            {[{id:"nai",label:"NAI"},{id:"gpt",label:"GPT（第三方）"}].map(b=>(
+              <Chip key={b.id} active={backend===b.id} onClick={()=>setBackend(b.id)}>{b.label}</Chip>
+            ))}
+          </div>
+          <button onClick={()=>handleGenerate()} disabled={generating||!canGenerate}
+            style={{ width:"100%",padding:"11px",borderRadius:T.radiusSm,border:"none",
+              backgroundColor:(generating||!canGenerate)?T.border:T.accent,
+              color:(generating||!canGenerate)?T.textMuted:"#fff",
+              fontSize:"12px",fontWeight:"500",cursor:(generating||!canGenerate)?"default":"pointer" }}>
+            {generating ? genProgress||"生成中…"
+              : (backend==="gpt"?settings.gptApiKey:settings.naiToken) ? "生成穿搭" : "生成穿搭（测试模式）"}
+          </button>
+          {!generating && !canGenerate && (
+            <p style={{ fontSize:"10px",color:T.textMuted,margin:"4px 0 0",textAlign:"center" }}>
+              至少填一项（主色、款式、季节、身高体重、脸型或描述）
+            </p>
+          )}
+          {!generating && canGenerate && !(backend==="gpt"?settings.gptApiKey:settings.naiToken) && (
+            <p style={{ fontSize:"10px",color:T.textMuted,margin:"4px 0 0",textAlign:"center" }}>
+              未填{backend==="gpt"?"GPT Key":"NAI Token"}，将生成占位色块用于流程测试
+            </p>
+          )}
+          {!generating && genProgress.startsWith("生成失败") && (
+            <p style={{ fontSize:"10px",color:T.warn,margin:"6px 0 0",lineHeight:1.5 }}>{genProgress}</p>
+          )}
+        </div>
+
+        {/* ── 搭配分析结果 ── */}
+        {analysis && (
+          <div style={{ marginBottom:"18px",padding:"12px",borderRadius:T.radius,
+            border:`1px solid ${T.border}`,backgroundColor:T.surface }}>
+            <button onClick={()=>setShowAnalysis(v=>!v)} style={{ width:"100%",display:"flex",
+              alignItems:"center",background:"none",border:"none",padding:0,cursor:"pointer" }}>
+              <span style={{ fontSize:"11px",fontWeight:"600",color:T.text,flex:1,textAlign:"left" }}>搭配分析</span>
+              <span style={{ fontSize:"10px",color:T.textMuted }}>{showAnalysis?"收起":"展开"}</span>
             </button>
-            {!settings.naiToken && !generating && (
-              <p style={{ fontSize:"10px",color:T.textMuted,margin:"4px 0 0",textAlign:"center" }}>
-                未填NAI Token，将生成占位色块用于流程测试
-              </p>
+            {showAnalysis && (
+              <p style={{ fontSize:"11px",color:T.textSub,margin:"10px 0 0",lineHeight:1.7,whiteSpace:"pre-wrap" }}>{analysis}</p>
             )}
           </div>
         )}
 
         {/* ── 生图结果 ── */}
-        {step==="result" && resultImg && (
+        {resultImg && (
           <div style={{ marginBottom:"18px" }} ref={resultRef}>
-            <SectionLabel>04 · 生成结果</SectionLabel>
+            {optLabel("生成结果")}
             <div style={{ borderRadius:T.radius,overflow:"hidden",border:`1px solid ${T.border}`,
               boxShadow:T.shadowMd,marginBottom:"10px",position:"relative",cursor:"context-menu" }}
               onContextMenu={e=>{e.preventDefault();setShowPromptEdit(v=>!v);setEditingPrompt(resultImg.prompt||"");}}
@@ -1052,10 +1360,9 @@ Write the comma-separated style tags now (cover every garment):`;
                 padding:"3px 7px",fontSize:"9px",color:"rgba(255,255,255,0.7)",
                 pointerEvents:"none" }}>右键/长按编辑Prompt</div>
             </div>
-            {/* prompt查看/编辑 */}
             {showPromptEdit ? (
               <div style={{ marginBottom:"10px" }}>
-                <p style={{ fontSize:"10px",color:T.textMuted,margin:"0 0 4px" }}>NAI Prompt（可编辑后重新生成）</p>
+                <p style={{ fontSize:"10px",color:T.textMuted,margin:"0 0 4px" }}>Prompt（可编辑后重新生成）</p>
                 <textarea value={editingPrompt} onChange={e=>setEditingPrompt(e.target.value)}
                   rows={5} style={{ width:"100%",padding:"9px 11px",borderRadius:T.radiusSm,
                     border:`1px solid ${T.border}`,backgroundColor:T.bg,fontSize:"10px",
@@ -1496,6 +1803,77 @@ function SettingsField({ label, fkey, placeholder, multiline, type, form, setFor
   );
 }
 
+// 密码字段：带显示/隐藏（Token / Key 通用）
+function SecretField({ label, fkey, placeholder, form, setForm }) {
+  const [show, setShow] = useState(false);
+  return (
+    <div style={{ marginBottom:"14px" }}>
+      <p style={{ fontSize:"10px",color:T.textMuted,margin:"0 0 5px",letterSpacing:"0.05em" }}>{label}</p>
+      <div style={{ position:"relative" }}>
+        <input type={show?"text":"password"} value={form[fkey]||""}
+          onChange={e=>setForm(p=>({...p,[fkey]:e.target.value}))}
+          placeholder={placeholder} autoComplete="off"
+          style={{ width:"100%",padding:"9px 38px 9px 11px",borderRadius:T.radiusSm,
+            border:`1px solid ${T.border}`,backgroundColor:T.bg,
+            fontSize:"11px",color:T.text,outline:"none",boxSizing:"border-box" }}/>
+        <button onClick={()=>setShow(v=>!v)} style={{
+          position:"absolute",right:"10px",top:"50%",transform:"translateY(-50%)",
+          background:"none",border:"none",cursor:"pointer",padding:"2px",
+          color:T.textMuted,fontSize:"14px",lineHeight:1 }}>{show?"🙈":"👁"}</button>
+      </div>
+    </div>
+  );
+}
+
+// 接口预设：把一组接口配置存成命名预设，一键切换。列表里只显示名称，不显示地址/密钥。
+function ConfigPresets({ presetsKey, keys, form, setForm, commit }) {
+  const [name, setName] = useState("");
+  const list = form[presetsKey] || [];
+  const isActive = (p) => keys.every(k => String(form[k] ?? "") === String(p.data[k] ?? ""));
+  const savePreset = () => {
+    const nm = name.trim(); if (!nm) return;
+    const data = {}; keys.forEach(k => { data[k] = form[k] ?? ""; });
+    const exists = list.some(p => p.name === nm);
+    const next = exists
+      ? list.map(p => p.name === nm ? { ...p, data } : p)
+      : [...list, { id:Date.now().toString(), name:nm, data }];
+    commit({ ...form, [presetsKey]:next });
+    setName("");
+  };
+  const apply = (p) => commit({ ...form, ...p.data });
+  const remove = (id) => commit({ ...form, [presetsKey]:list.filter(p => p.id !== id) });
+  return (
+    <div style={{ marginBottom:"14px",padding:"10px",borderRadius:T.radiusSm,
+      border:`1px dashed ${T.border}`,backgroundColor:T.bg }}>
+      <p style={{ fontSize:"10px",color:T.textMuted,margin:"0 0 8px",letterSpacing:"0.05em" }}>接口预设</p>
+      {list.length > 0 && (
+        <div style={{ display:"flex",gap:"6px",flexWrap:"wrap",marginBottom:"8px" }}>
+          {list.map(p=>(
+            <div key={p.id} style={{ display:"flex",alignItems:"center",borderRadius:"14px",overflow:"hidden",
+              border:`1px solid ${isActive(p)?T.accent:T.border}`,
+              backgroundColor:isActive(p)?T.accent:T.surface }}>
+              <button onClick={()=>apply(p)} style={{ padding:"5px 10px",border:"none",background:"none",
+                fontSize:"11px",cursor:"pointer",color:isActive(p)?"#fff":T.textSub }}>{p.name}</button>
+              <button onClick={()=>remove(p.id)} style={{ padding:"5px 8px 5px 0",border:"none",background:"none",
+                fontSize:"12px",cursor:"pointer",color:isActive(p)?"rgba(255,255,255,0.7)":T.textMuted }}>×</button>
+            </div>
+          ))}
+        </div>
+      )}
+      <div style={{ display:"flex",gap:"6px" }}>
+        <input value={name} onChange={e=>setName(e.target.value)} placeholder="给当前配置起个名字"
+          style={{ flex:1,padding:"7px 10px",borderRadius:T.radiusXs,border:`1px solid ${T.border}`,
+            backgroundColor:T.surface,fontSize:"11px",color:T.text,outline:"none",boxSizing:"border-box" }}/>
+        <Btn onClick={savePreset} disabled={!name.trim()} variant="soft" style={{ fontSize:"11px",padding:"7px 12px" }}>保存为预设</Btn>
+      </div>
+    </div>
+  );
+}
+
+const NAI_KEYS = ["naiProxyUrl","naiToken","naiModel","naiSampler","naiNoiseSchedule","naiSteps","naiScale","naiCfg","naiSize"];
+const GPT_KEYS = ["gptBaseUrl","gptApiKey","gptModel","gptSize"];
+const LLM_KEYS = ["llmMode","llmBaseUrl","llmApiKey","llmModel","llmTemperature","llmMaxTokens","llmStream"];
+
 function SettingsPage({ settings, setSettings }) {
   const [form, setForm] = useState(settings);
   const [saved, setSaved] = useState(false);
@@ -1511,6 +1889,9 @@ function SettingsPage({ settings, setSettings }) {
     setSaved(true);
     setTimeout(()=>setSaved(false),1800);
   };
+
+  // 立即保存并生效（预设的保存/应用/删除用）
+  const commit = (next) => { setForm(next); setSettings(next); saveSettings(next); };
 
   const addPreset = () => {
     if (!newPresetName.trim()) return;
@@ -1555,24 +1936,9 @@ function SettingsPage({ settings, setSettings }) {
     <div style={{ overflowY:"auto",padding:"16px",height:"100%",boxSizing:"border-box" }}>
 
       <SettingsSection title="NAI 生图">
-        <SettingsField form={form} setForm={setForm} label="中转站 URL" fkey="naiProxyUrl" placeholder="https://std.loliyc.com/api/generate"/>
-        {/* Token字段：密码模式+眼睛切换 */}
-        <div style={{ marginBottom:"14px" }}>
-          <p style={{ fontSize:"10px",color:T.textMuted,margin:"0 0 5px",letterSpacing:"0.05em" }}>Token（STD-xxxxxx）</p>
-          <div style={{ position:"relative" }}>
-            <input type={showToken?"text":"password"} value={form.naiToken||""}
-              onChange={e=>setForm(p=>({...p,naiToken:e.target.value}))}
-              placeholder="STD-xxxxxxxx"
-              style={{ width:"100%",padding:"9px 38px 9px 11px",borderRadius:T.radiusSm,
-                border:`1px solid ${T.border}`,backgroundColor:T.bg,
-                fontSize:"11px",color:T.text,outline:"none",boxSizing:"border-box" }}/>
-            <button onClick={()=>setShowToken(v=>!v)} style={{
-              position:"absolute",right:"10px",top:"50%",transform:"translateY(-50%)",
-              background:"none",border:"none",cursor:"pointer",padding:"2px",
-              color:T.textMuted,fontSize:"14px",lineHeight:1,
-            }}>{showToken?"🙈":"👁"}</button>
-          </div>
-        </div>
+        <ConfigPresets presetsKey="naiPresets" keys={NAI_KEYS} form={form} setForm={setForm} commit={commit}/>
+        <SettingsField form={form} setForm={setForm} label="接口地址 URL" fkey="naiProxyUrl" placeholder="https://…/api/generate"/>
+        <SecretField form={form} setForm={setForm} label="Token" fkey="naiToken" placeholder="粘贴 Token"/>
         <SettingsField form={form} setForm={setForm} label="模型" fkey="naiModel" placeholder="nai-diffusion-4-5-full"/>
         <div style={{ display:"flex",gap:"10px",marginBottom:"14px" }}>
           <div style={{ flex:1 }}>
@@ -1630,6 +1996,21 @@ function SettingsPage({ settings, setSettings }) {
         </div>
         <SettingsField form={form} setForm={setForm} label="Negative Prompt" fkey="negative"
           placeholder="lowres, worst quality, bad anatomy, text, watermark…" multiline/>
+      </SettingsSection>
+
+      <SettingsSection title="GPT 生图（第三方）">
+        <ConfigPresets presetsKey="gptPresets" keys={GPT_KEYS} form={form} setForm={setForm} commit={commit}/>
+        <SettingsField form={form} setForm={setForm} label="接口地址 URL" fkey="gptBaseUrl" placeholder="https://…"/>
+        <SecretField form={form} setForm={setForm} label="API Key" fkey="gptApiKey" placeholder="粘贴 API Key"/>
+        <SettingsField form={form} setForm={setForm} label="模型" fkey="gptModel" placeholder="gpt-image-1"/>
+        <div style={{ marginBottom:"14px" }}>
+          <p style={{ fontSize:"10px",color:T.textMuted,margin:"0 0 5px" }}>尺寸</p>
+          <select value={form.gptSize||"1024x1536"} onChange={e=>setForm(p=>({...p,gptSize:e.target.value}))}
+            style={{ width:"100%",padding:"9px 11px",borderRadius:T.radiusSm,
+              border:`1px solid ${T.border}`,backgroundColor:T.bg,fontSize:"11px",color:T.text,outline:"none" }}>
+            {["1024x1536","1024x1024","1536x1024"].map(s=>(<option key={s} value={s}>{s}</option>))}
+          </select>
+        </div>
       </SettingsSection>
 
       <SettingsSection title="画师串预设">
@@ -1711,6 +2092,7 @@ function SettingsPage({ settings, setSettings }) {
       </SettingsSection>
 
       <SettingsSection title="文字 AI">
+        <ConfigPresets presetsKey="llmPresets" keys={LLM_KEYS} form={form} setForm={setForm} commit={commit}/>
         {/* 接口模式切换 */}
         <div style={{ marginBottom:"14px" }}>
           <p style={{ fontSize:"10px",color:T.textMuted,margin:"0 0 6px",letterSpacing:"0.05em" }}>接口类型</p>
@@ -1731,7 +2113,7 @@ function SettingsPage({ settings, setSettings }) {
         {(form.llmMode==="openai") && (
           <>
             <SettingsField form={form} setForm={setForm} label="Base URL" fkey="llmBaseUrl" placeholder="https://api.openai.com 或第三方地址"/>
-            <SettingsField form={form} setForm={setForm} label="API Key" fkey="llmApiKey" placeholder="sk-xxxxxxx 或第三方key" type="password"/>
+            <SecretField form={form} setForm={setForm} label="API Key" fkey="llmApiKey" placeholder="粘贴 API Key"/>
           </>
         )}
 
@@ -1765,6 +2147,36 @@ function SettingsPage({ settings, setSettings }) {
                 border:`1px solid ${T.border}`,backgroundColor:T.bg,
                 fontSize:"11px",color:T.text,outline:"none",boxSizing:"border-box" }}/>
           )}
+        </div>
+        <div style={{ display:"flex",gap:"10px",marginBottom:"14px" }}>
+          <div style={{ flex:1 }}>
+            <p style={{ fontSize:"10px",color:T.textMuted,margin:"0 0 5px" }}>温度 Temperature</p>
+            <input type="number" step="0.1" min="0" max="2" value={form.llmTemperature??""}
+              onChange={e=>setForm(p=>({...p,llmTemperature:e.target.value}))} placeholder="0.7"
+              style={{ width:"100%",padding:"9px 11px",borderRadius:T.radiusSm,
+                border:`1px solid ${T.border}`,backgroundColor:T.bg,fontSize:"11px",color:T.text,outline:"none",boxSizing:"border-box" }}/>
+          </div>
+          <div style={{ flex:1 }}>
+            <p style={{ fontSize:"10px",color:T.textMuted,margin:"0 0 5px" }}>Token 上限</p>
+            <input type="number" min="1" value={form.llmMaxTokens??""}
+              onChange={e=>setForm(p=>({...p,llmMaxTokens:e.target.value}))} placeholder="1500"
+              style={{ width:"100%",padding:"9px 11px",borderRadius:T.radiusSm,
+                border:`1px solid ${T.border}`,backgroundColor:T.bg,fontSize:"11px",color:T.text,outline:"none",boxSizing:"border-box" }}/>
+          </div>
+        </div>
+        <div style={{ marginBottom:"14px" }}>
+          <p style={{ fontSize:"10px",color:T.textMuted,margin:"0 0 6px",letterSpacing:"0.05em" }}>流式输出</p>
+          <div style={{ display:"flex",gap:"6px" }}>
+            {[{v:true,l:"开"},{v:false,l:"关"}].map(o=>(
+              <button key={o.l} onClick={()=>setForm(p=>({...p,llmStream:o.v}))}
+                style={{ flex:1,padding:"8px",borderRadius:T.radiusSm,border:"none",fontSize:"11px",cursor:"pointer",
+                  backgroundColor:!!form.llmStream===o.v?T.accent:T.accentSoft,
+                  color:!!form.llmStream===o.v?"#fff":T.textSub }}>{o.l}</button>
+            ))}
+          </div>
+          <p style={{ fontSize:"10px",color:T.textMuted,margin:"6px 0 0",lineHeight:1.5 }}>
+            部分第三方接口不支持流式，遇到报错请关闭。
+          </p>
         </div>
         <SettingsField form={form} setForm={setForm} label="审美偏好描述（辅助prompt生成）" fkey="aestheticDesc"
           placeholder="如：日系街拍、宽松廓形、低饱和莫兰迪色系…" multiline/>
@@ -1808,13 +2220,17 @@ function SettingsPage({ settings, setSettings }) {
 // ═══════════════════════════════════════════════════════
 const SETTINGS_KEY = "wardrobe_settings_v1";
 const DEFAULT_SETTINGS = {
-  naiToken:"", naiProxyUrl:"https://std.loliyc.com/api/generate",
+  // 接口地址默认留空：别人打开页面时不会看到任何预填地址，自己的配置存成命名预设
+  naiToken:"", naiProxyUrl:"",
   naiModel:"nai-diffusion-4-5-full", naiSize:"竖图",
   naiSampler:"k_dpmpp_2m", naiNoiseSchedule:"karras",
   naiScale:"5", naiSteps:"28", naiCfg:"0",
   negative:"lowres, worst quality, bad anatomy, text, watermark, signature",
   artistPresets:[], activePreset:null,
+  gptBaseUrl:"", gptApiKey:"", gptModel:"gpt-image-1", gptSize:"1024x1536",
+  naiPresets:[], gptPresets:[], llmPresets:[],
   llmMode:"anthropic", llmBaseUrl:"", llmApiKey:"", llmModel:"claude-sonnet-4-6",
+  llmTemperature:"0.7", llmMaxTokens:"1500", llmStream:false,
   aestheticDesc:"", charCard:"", memory:"",
   poolRetention:"1m", // 衣橱生成图保留期限：1w / 1m / forever
 };
@@ -1998,6 +2414,7 @@ function loadMaterials() {
 
 export default function App() {
   const [tab, setTab] = useState("generate");
+  const [homeSignal, setHomeSignal] = useState(0);
   const [genPool, setGenPool] = useState(loadPoolWithImages);
   const [settings, setSettings] = useState(loadSettings);
 
@@ -2011,19 +2428,9 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ── 搭配页state提升，tab切换不丢失 ──
+  // 搭配页自己保存输入与结果（组件不卸载，tab 切换不丢）；这里只保留跨页共享的部分
   const [chatMessages, setChatMessages] = useState([]); // 对话历史跨tab保留
   const [materials, setMaterials] = useState(loadMaterials); // 材料区，持久化
-  const [genStep, setGenStep] = useState("upload");
-  const [genUploadedImg, setGenUploadedImg] = useState(null);
-  const [genExtractedColors, setGenExtractedColors] = useState([]);
-  const [genSelectedColor, setGenSelectedColor] = useState(null);
-  const [genSelectedSkin, setGenSelectedSkin] = useState(null);
-  const [genSchemes, setGenSchemes] = useState([]);
-  const [genSelectedScheme, setGenSelectedScheme] = useState(null);
-  const [genGenerating, setGenGenerating] = useState(false);
-  const [genProgress, setGenProgress] = useState("");
-  const [genResultImg, setGenResultImg] = useState(null);
 
   const handleSaveToWardrobe = (img) => {
     setGenPool(prev => {
@@ -2062,6 +2469,9 @@ export default function App() {
     });
   };
 
+  // 顶部图标：回到搭配首页并滚到顶部
+  const goHome = () => { setTab("generate"); setHomeSignal(n => n + 1); };
+
   const TABS = [
     { key:"generate", label:"搭配", icon:"✦" },
     { key:"wardrobe", label:"衣橱", icon:"⊞" },
@@ -2074,10 +2484,18 @@ export default function App() {
       fontFamily:"-apple-system,'PingFang SC','Microsoft YaHei',sans-serif",
       maxWidth:"480px",margin:"0 auto" }}>
 
-      {/* Header */}
-      <div style={{ padding:"13px 16px 10px",borderBottom:`1px solid ${T.border}`,
-        backgroundColor:T.surface,flexShrink:0 }}>
-        <h1 style={{ fontSize:"14px",fontWeight:"600",color:T.text,margin:0 }}>穿搭配色</h1>
+      {/* Header：只放图标，点击回到首页 */}
+      <div style={{ padding:"8px 16px",borderBottom:`1px solid ${T.border}`,
+        backgroundColor:T.surface,flexShrink:0,display:"flex",alignItems:"center" }}>
+        <button onClick={goHome} aria-label="回到搭配首页" title="回到搭配首页" style={{
+          background:"none",border:"none",padding:"4px",cursor:"pointer",
+          display:"flex",alignItems:"center",justifyContent:"center" }}>
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke={T.text}
+            strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M12 8V7.2a2.2 2.2 0 1 0-2.2-2.2"/>
+            <path d="M12 8 3.3 14.4a1.6 1.6 0 0 0 .95 2.9h15.5a1.6 1.6 0 0 0 .95-2.9L12 8Z"/>
+          </svg>
+        </button>
       </div>
 
       {/* 内容：用display:none切换，保持组件不卸载，state不丢 */}
@@ -2087,16 +2505,7 @@ export default function App() {
             settings={settings} onSaveToWardrobe={handleSaveToWardrobe} onUpdateMemory={handleUpdateMemory}
             onAddMaterial={handleAddMaterial}
             chatMessages={chatMessages} setChatMessages={setChatMessages}
-            step={genStep} setStep={setGenStep}
-            uploadedImg={genUploadedImg} setUploadedImg={setGenUploadedImg}
-            extractedColors={genExtractedColors} setExtractedColors={setGenExtractedColors}
-            selectedColor={genSelectedColor} setSelectedColor={setGenSelectedColor}
-            selectedSkin={genSelectedSkin} setSelectedSkin={setGenSelectedSkin}
-            schemes={genSchemes} setSchemes={setGenSchemes}
-            selectedScheme={genSelectedScheme} setSelectedScheme={setGenSelectedScheme}
-            generating={genGenerating} setGenerating={setGenGenerating}
-            genProgress={genProgress} setGenProgress={setGenProgress}
-            resultImg={genResultImg} setResultImg={setGenResultImg}
+            homeSignal={homeSignal}
           />
         </div>
         <div style={{ display:tab==="wardrobe"?"flex":"none", flexDirection:"column", flex:1, overflow:"hidden" }}>
